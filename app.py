@@ -161,7 +161,7 @@ with st.sidebar:
     rpm           = st.number_input("Turntable speed (RPM)", value=33.333,
                                     min_value=16.0, max_value=78.0, step=0.001,
                                     format="%.3f")
-    apply_riaa    = st.checkbox("Apply inverse RIAA correction", value=False)
+    apply_riaa    = False  # Removed — FM method is RIAA-immune, correction not needed
 
     st.divider()
 
@@ -233,8 +233,7 @@ def load_wav(uploaded_file):
     if pk > 0:
         data = data / pk
 
-    if apply_riaa:
-        data = core.apply_inverse_riaa(data, fs)
+    # Inverse RIAA correction removed — not needed, FM method is RIAA-immune
         pk2  = np.max(np.abs(data))
         if pk2 > 0:
             data = data / pk2
@@ -262,7 +261,7 @@ if app_mode == "📊 Analyse":
         uploaded = st.file_uploader(
             "Upload your WAV recording of the test record",
             type=["wav"],
-            help="Record the test band flat (no RIAA), or enable 'Apply inverse RIAA' in the sidebar.",
+            help="Record the test band flat (no RIAA) or through a RIAA preamp — both give correct results.",
         )
     else:
         uploaded = None
@@ -426,7 +425,6 @@ if app_mode == "📊 Analyse":
                 f"RPM         : {rpm:.3f}\n"
                 f"Channel     : {channel}\n"
                 f"Swap L/R    : {swap_channels}\n"
-                f"Inv RIAA    : {apply_riaa}\n"
                 f"Sample rate : {r0['fs']:.0f} Hz",
                 language="text",
             )
