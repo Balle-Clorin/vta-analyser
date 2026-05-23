@@ -7,6 +7,7 @@ Run with:
     streamlit run app.py
 """
 
+import gc
 import io
 import os
 import sys
@@ -97,6 +98,17 @@ def load_core():
     return mod
 
 core = load_core()
+
+# ── Memory cleanup helper ─────────────────────────────────────────────────────
+def cleanup_memory(*arrays):
+    """Delete numpy arrays and force garbage collection."""
+    for arr in arrays:
+        try:
+            del arr
+        except Exception:
+            pass
+    plt.close('all')   # close any stray matplotlib figures
+    gc.collect()
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SIDEBAR
@@ -204,12 +216,18 @@ def load_wav(uploaded_file):
         st.stop()
 
     raw = uploaded_file.read()
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(raw)
-        tmp_path = tmp.name
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+        del raw   # free the raw bytes immediately
+        gc.collect()
 
-    data, fs = sf.read(tmp_path, always_2d=True)
-    os.unlink(tmp_path)
+        data, fs = sf.read(tmp_path, always_2d=True)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
     pk = np.max(np.abs(data))
     if pk > 0:
@@ -221,7 +239,7 @@ def load_wav(uploaded_file):
         if pk2 > 0:
             data = data / pk2
 
-    return data, fs, tmp_path   # tmp_path returned for calibrate_peak_vel signature
+    return data, fs
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -273,16 +291,18 @@ if app_mode == "📊 Analyse":
                 }
                 wav_name = "(demo/synthetic)"
             else:
-                data, fs, _ = load_wav(uploaded)
+                data, fs = load_wav(uploaded)
                 if channel == 'both' and data.shape[1] >= 2:
                     channels_to_run = ['L', 'R']
                 else:
                     channels_to_run = [channel if channel != 'both' else 'L']
                 audio_map = {
-                    ch: data[:, (0 if ch == 'L' else min(1, data.shape[1]-1))]
+                    ch: data[:, (0 if ch == 'L' else min(1, data.shape[1]-1))].copy()
                     for ch in channels_to_run
                 }
                 wav_name = uploaded.name
+                del data   # free the full stereo array — we only need per-channel slices
+                gc.collect()
 
         results_all = []
         progress    = st.progress(0, text="Analysing…")
@@ -307,6 +327,10 @@ if app_mode == "📊 Analyse":
                     st.warning(str(w.message))
 
         progress.progress(1.0, text="Done ✓")
+
+        # Free audio data — no longer needed after analysis
+        del audio_map
+        gc.collect()
 
         ang_label = "HTA" if core.MODULATION == 'lateral' else "VTA"
         st.divider()
@@ -382,6 +406,10 @@ if app_mode == "📊 Analyse":
             fig_chain = core.plot_signal_chain(results_all[0])
             st.pyplot(fig_chain, use_container_width=True)
             plt.close(fig_chain)
+
+        # Final cleanup — release results and any remaining figure memory
+        plt.close('all')
+        gc.collect()
 
         with st.expander("⚙️ Settings used for this run"):
             r0 = results_all[0]
@@ -488,34 +516,42 @@ Two methods are available — run both when possible:
         with st.spinner("Running calibration — this may take 20–30 seconds…"):
             # Write WAV to temp file (calibrate_peak_vel needs a file path)
             raw = uploaded_cal.read()
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(raw)
-                tmp_path = tmp.name
-
-            # Capture printed output from calibrate_peak_vel
-            captured = io.StringIO()
-            old_out  = sys.stdout
-            sys.stdout = captured
-
+            tmp_path = None
             try:
-                cal_result = core.calibrate_peak_vel(
-                    wav_path             = tmp_path,
-                    known_vta_deg        = known_vta,
-                    f_low                = core.F_MOD,
-                    f_high               = core.F_CARRIER,
-                    theta_r              = core.RECORDING_ANGLE,
-                    ref_displacement_um  = ref_disp_um,
-                    ref_carrier_db       = ref_carrier_db,
-                    calibration_method   = cal_method_key,
-                )
-            except Exception as e:
-                sys.stdout = old_out
-                os.unlink(tmp_path)
-                st.error(f"Calibration failed: {e}")
-                st.stop()
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp.write(raw)
+                    tmp_path = tmp.name
+                del raw
+                gc.collect()
 
-            sys.stdout = old_out
-            os.unlink(tmp_path)
+                # Capture printed output from calibrate_peak_vel
+                captured = io.StringIO()
+                old_out  = sys.stdout
+                sys.stdout = captured
+
+                try:
+                    cal_result = core.calibrate_peak_vel(
+                        wav_path             = tmp_path,
+                        known_vta_deg        = known_vta,
+                        f_low                = core.F_MOD,
+                        f_high               = core.F_CARRIER,
+                        theta_r              = core.RECORDING_ANGLE,
+                        ref_displacement_um  = ref_disp_um,
+                        ref_carrier_db       = ref_carrier_db,
+                        calibration_method   = cal_method_key,
+                    )
+                except Exception as e:
+                    sys.stdout = old_out
+                    st.error(f"Calibration failed: {e}")
+                    st.stop()
+                finally:
+                    sys.stdout = old_out
+
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                gc.collect()
+
             log_text = captured.getvalue()
 
         # ── Display results ───────────────────────────────────────────────────
