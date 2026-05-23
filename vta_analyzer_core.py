@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Created on Thu May 14 16:42:36 2026
 
@@ -113,7 +114,7 @@ DEMO_MODE       = False
 # ── Your WAV file (only used when DEMO_MODE = False) ─────────────────────────
 # Windows:   r"C:\Users\YourName\recordings\track2.wav"
 # Mac/Linux: "/home/yourname/recordings/track2.wav"
-AUDIO_FILE      = r"2026 V15-IV-SASB -6VTA 1G5 STR-112 400-4K 6DB VERTICAL.wav"
+AUDIO_FILE      = r"kladd line in.wav"
 
 # ── Calibration mode ─────────────────────────────────────────────────────────
 # Set CALIBRATION_MODE = True to calculate the correct PEAK_VEL for your
@@ -214,7 +215,7 @@ CUSTOM_RECORDING_ANGLE = 16.5        # recording angle (°): 16.5° CBS vertical
 #   - Flat records recorded with flat/bypass preamp  (normal CBS STR-112 use)
 #   - RIAA records (e.g. Analogue Magic) recorded with RIAA playback applied
 #     (the RIAA curve is intentional and already accounted for in PEAK_VEL)
-APPLY_INVERSE_RIAA = False
+# APPLY_INVERSE_RIAA removed — not needed, see comment above
 
 # ── Turntable speed (RPM) ─────────────────────────────────────────────────────
 # Used to compute groove tangential velocity c = 2π × R × rpm/60.
@@ -230,7 +231,7 @@ SHOW_SIGNAL_CHAIN = False
 SHOW_METER        = True
 
 # ── Meter description ─────────────────────────────────────────────────────────
-METER_DESCRIPTION = "51F V15-IV-SASB -6VTS VTF 1.5G — CBS STR-112 +6dB 400:4k vertical"
+METER_DESCRIPTION = "kladd riaa.wav"
 
 # ── Demo mode only ────────────────────────────────────────────────────────────
 DEMO_VTA_ERROR  = 5.0
@@ -358,6 +359,8 @@ def apply(sos, x):
 #  INVERSE RIAA FILTER
 # ═════════════════════════════════════════════════════════════════════════════
 
+# NOTE: Functions below are kept for reference only — no longer called.
+# The FM discriminator method is inherently RIAA-immune (verified).
 def _make_inverse_riaa_sos(fs: float):
     """
     Design a digital inverse RIAA filter (IEC 60098 time constants).
@@ -747,7 +750,7 @@ def analyse(audio: np.ndarray, fs: float,
                 f"\n⚠  POSSIBLE RIAA EQUALIZATION DETECTED  "
                 f"({f_low:.0f}Hz/{f_high:.0f}Hz ratio = {ratio_db:.1f} dB)\n"
                 f"   This may indicate a flat test record was played through\n"
-                f"   a RIAA phono stage. Set APPLY_INVERSE_RIAA = True, or\n"
+                f"   a RIAA phono stage. record using your preamp FLAT/BYPASS mode (or use RIAA — both give correct results).\n"
                 f"   re-record using your preamp FLAT/BYPASS mode.",
                 UserWarning, stacklevel=2)
         elif e_low < 1e-6:
@@ -1732,13 +1735,12 @@ if __name__ == '__main__':
         if pk > 0:
             data = data / pk
 
-        if APPLY_INVERSE_RIAA:
-            data = apply_inverse_riaa(data, fs)
+        # Inverse RIAA correction removed — FM method is RIAA-immune
             # Re-normalise after filtering
             pk2 = np.max(np.abs(data))
             if pk2 > 0:
                 data = data / pk2
-            print("  [Inverse RIAA applied — flat record recorded through RIAA preamp]")
+
 
         print(f"\nLoaded: {AUDIO_FILE}")
         print(f"  Sample rate : {fs:.0f} Hz")
