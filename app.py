@@ -161,7 +161,7 @@ with st.sidebar:
     rpm           = st.number_input("Turntable speed (RPM)", value=33.333,
                                     min_value=16.0, max_value=78.0, step=0.001,
                                     format="%.3f")
-    apply_riaa    = False  # Removed — FM method is RIAA-immune, correction not needed
+    apply_riaa    = st.checkbox("Apply inverse RIAA correction", value=False)
 
     st.divider()
 
@@ -233,7 +233,8 @@ def load_wav(uploaded_file):
     if pk > 0:
         data = data / pk
 
-    # Inverse RIAA correction removed — not needed, FM method is RIAA-immune
+    if apply_riaa:
+        data = core.apply_inverse_riaa(data, fs)
         pk2  = np.max(np.abs(data))
         if pk2 > 0:
             data = data / pk2
@@ -261,7 +262,7 @@ if app_mode == "📊 Analyse":
         uploaded = st.file_uploader(
             "Upload your WAV recording of the test record",
             type=["wav"],
-            help="Record the test band flat (no RIAA) or through a RIAA preamp — both give correct results.",
+            help="Record the test band flat (no RIAA), or enable 'Apply inverse RIAA' in the sidebar.",
         )
     else:
         uploaded = None
@@ -326,10 +327,6 @@ if app_mode == "📊 Analyse":
                     st.warning(str(w.message))
 
         progress.progress(1.0, text="Done ✓")
-
-        # Free audio data — no longer needed after analysis
-        del audio_map
-        gc.collect()
 
         ang_label = "HTA" if core.MODULATION == 'lateral' else "VTA"
         st.divider()
@@ -400,6 +397,10 @@ if app_mode == "📊 Analyse":
             st.pyplot(fig_spec, use_container_width=True)
             plt.close(fig_spec)
 
+        # Free audio data — no longer needed after spectrum plot
+        del audio_map
+        gc.collect()
+
         if show_chain:
             st.subheader("🔗 Patent Signal Chain")
             fig_chain = core.plot_signal_chain(results_all[0])
@@ -425,6 +426,7 @@ if app_mode == "📊 Analyse":
                 f"RPM         : {rpm:.3f}\n"
                 f"Channel     : {channel}\n"
                 f"Swap L/R    : {swap_channels}\n"
+                f"Inv RIAA    : {apply_riaa}\n"
                 f"Sample rate : {r0['fs']:.0f} Hz",
                 language="text",
             )
