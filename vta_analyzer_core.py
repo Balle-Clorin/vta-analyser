@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-# -*- coding: utf-8 -*-
 """
 Created on Thu May 14 16:42:36 2026
 
@@ -18,7 +17,11 @@ Vertical Tracking Angle (VTA) & Tracing Distortion Analyzer
 ============================================================
 Software implementation of US Patent 4,359,768 (CBS Inc., 1982)
 "Vertical Tracking Angle Meter" — Abbagnaro & Gust
-Version 5.0 — 200Hz bands added (lateral+vertical), coefficient scaling bug fixed
+Version 5.1 — Auto-detection of actual tone frequencies (fixes turntable speed error / non-standard cutting frequency)
+            — RIAA phase warning: amplitude threshold lowered to 20dB, plus phi-based warning for RIAA records played through RIAA preamp
+Version 5.2 — User-configurable reference recording angles RECORDING_ANGLE_VERTICAL / RECORDING_ANGLE_LATERAL
+            — Removes hardcoded 16.5°/0.0° from resolve block; STR-111 support via RECORDING_ANGLE_VERTICAL = 15.0
+            — Low-F sanity check warns when TONE_PAIR does not match actual record track (F < 5 Hz threshold)
 
 Signal chain (Fig. 4 of patent):
 
@@ -114,7 +117,7 @@ DEMO_MODE       = False
 # ── Your WAV file (only used when DEMO_MODE = False) ─────────────────────────
 # Windows:   r"C:\Users\YourName\recordings\track2.wav"
 # Mac/Linux: "/home/yourname/recordings/track2.wav"
-AUDIO_FILE      = r"kladd line in.wav"
+AUDIO_FILE      = r"2026 GYRO OC9 CBS STR-112 imd vertical 6db 400-4000.wav"
 
 # ── Calibration mode ─────────────────────────────────────────────────────────
 # Set CALIBRATION_MODE = True to calculate the correct PEAK_VEL for your
@@ -162,7 +165,7 @@ CHANNEL         = 'both'   # 'L', 'R', or 'both' (recommended)
 # │  Set the three parameters below. All other values are set automatically. │
 # └──────────────────────────────────────────────────────────────────────────┘
 
-# Tone pair:   '400+4000' = outer half Side B  |  '200+4000' = inner half Side B
+# Tone pair:   '400+4000' = outer half Side B  |  '200+4000' = inner half Side B or custom
 TONE_PAIR       = '400+4000'
 
 # Modulation:  'vertical' = VTA measurement (Group 2B)
@@ -192,6 +195,27 @@ MODULATION      = 'vertical'
 #   200+4000     lateral      +15dB   0.07960   0.089
 BAND            = '+6dB'
 
+# ── Reference recording angles (θR) ──────────────────────────────────────────
+# These are the angles at which the test record was cut.
+# They are used as the reference point (zero-error) in the VTA/HTA formula.
+#
+# VERTICAL (θR for VTA measurement):
+#   16.5° — CBS STR-112, measured by White & Gust (1979) using 11 pickups.
+#            This is the most reliably calibrated value available.
+#   15.0° — Early records (pre-1970s IEC standard), e.g. CBS STR-111 (1966).
+#            Springback correction was not applied when the STR-111 was cut,
+#            so the effective groove angle may differ from the cutter setting.
+#            Treat STR-111 VTA results as relative measurements only.
+#   20.0° — Some later test records and direct-cut audiophile pressings.
+#   Set to None to use the default: 16.5° for CBS STR-112, 0° for lateral.
+#
+# LATERAL (θR for HTA measurement):
+#   0.0°  — Correct for all standard stereo records (zero lateral offset).
+#            Only change this if your test record was deliberately cut with
+#            a known lateral offset angle (uncommon).
+RECORDING_ANGLE_VERTICAL = 16.5   # degrees — θR for VTA (vertical modulation)
+RECORDING_ANGLE_LATERAL  = 0.0    # degrees — θR for HTA (lateral modulation)
+
 # ┌──────────────────────────────────────────────────────────────────────────┐
 # │  MODE 2 — CUSTOM  (any other test record, or manual CBS override)        │
 # │                                                                          │
@@ -199,11 +223,15 @@ BAND            = '+6dB'
 # │  These values are always present but only used when TONE_PAIR = 'custom'.│
 # └──────────────────────────────────────────────────────────────────────────┘
 CUSTOM_MODULATION      = 'vertical'  # 'vertical' or 'lateral'
-CUSTOM_F_MOD           = 400.0       # low modulating frequency (Hz) e.g. 60, 200, 400
-CUSTOM_F_CARRIER       = 4000.0      # carrier frequency (Hz) e.g. 4000, 7000
-CUSTOM_PEAK_VEL        = 0.0563      # peak source velocity (m/s) from record spec
-CUSTOM_GROOVE_RADIUS   = 0.114       # groove radius (m) — measure on record with ruler
-CUSTOM_RECORDING_ANGLE = 16.5        # recording angle (°): 16.5° CBS vertical (measured by White & Gust), 0° lateral
+CUSTOM_F_MOD           = 399       # low modulating frequency (Hz) e.g. 60, 200, 400
+CUSTOM_F_CARRIER       = 4022      # carrier frequency (Hz) e.g. 4000, 7000
+CUSTOM_PEAK_VEL        = 0.092      # peak source velocity (m/s) from record spec
+CUSTOM_GROOVE_RADIUS   = 0.122       # groove radius (m) — measure on record with ruler
+CUSTOM_RECORDING_ANGLE = 23       # recording angle (°): use RECORDING_ANGLE_VERTICAL /
+                                  # RECORDING_ANGLE_LATERAL above for MODE 1 (CBS).
+                                  # For MODE 2 (custom), set this value directly.
+                                  # 16.5° = CBS STR-112 vertical (White & Gust)
+                                  # 0°    = standard lateral
 
 # ── Inverse RIAA correction ──────────────────────────────────────────────────
 # Set to True if you recorded a FLAT test record (e.g. CBS STR-112) through
@@ -231,10 +259,10 @@ SHOW_SIGNAL_CHAIN = False
 SHOW_METER        = True
 
 # ── Meter description ─────────────────────────────────────────────────────────
-METER_DESCRIPTION = "kladd riaa.wav"
-
+METER_DESCRIPTION = "2026 GYRO OC9 CBS STR-112 SIDE B IMD 6db 400:4k vertical"
 # ── Demo mode only ────────────────────────────────────────────────────────────
-DEMO_VTA_ERROR  = 5.0
+DEMO_VTA_ERROR  = 6.0   # degrees — VTA error injected in demo signal
+#                          6° with imd_factor=3 gives ~6% IM% matching real STR-111 data
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  END OF USER SETTINGS  —  do not edit below this line
@@ -317,7 +345,11 @@ else:
             f"Valid choices: {_valid}")
     PEAK_VEL      = _tone_table[BAND]['peak_vel']
     GROOVE_RADIUS = _tone_table[BAND]['groove_radius']
-    RECORDING_ANGLE = 0.0 if MODULATION == 'lateral' else 16.5
+    # Use user-configurable recording angles (set above).
+    # RECORDING_ANGLE_VERTICAL defaults to 16.5° (White & Gust CBS STR-112).
+    # RECORDING_ANGLE_LATERAL  defaults to 0.0°  (standard stereo geometry).
+    RECORDING_ANGLE = (RECORDING_ANGLE_LATERAL  if MODULATION == 'lateral'
+                       else RECORDING_ANGLE_VERTICAL)
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  RECORD / INSTRUMENT CONSTANTS  (adjust to match your setup)
@@ -701,8 +733,143 @@ def tracing_distortion(dev_signal: np.ndarray, fs: float,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  FULL ANALYSIS PIPELINE
+#  ACTUAL TONE FREQUENCY DETECTION
+#  Finds the true frequency of each tone in the recording via parabolic
+#  interpolation on the FFT magnitude peak.  This corrects for:
+#    • Turntable speed error  (e.g. 33⅓ rpm running slow/fast)
+#    • Records cut at non-standard frequencies (e.g. 399 Hz instead of 400 Hz)
+#  Without this correction a 1 Hz offset between the nominal and actual f_low
+#  causes a 1 Hz beat in the chopper reference, rotating φ through 360° once
+#  per second — making phase (and therefore HTA/VTA) essentially random.
 # ═════════════════════════════════════════════════════════════════════════════
+
+def detect_actual_frequency(audio: np.ndarray, fs: float,
+                             f_nominal: float,
+                             search_range: float = None) -> float:
+    """
+    Return the actual frequency of the dominant tone near f_nominal (Hz).
+
+    Uses a long-FFT magnitude spectrum for frequency resolution, then
+    parabolic interpolation between the three bins around the peak for
+    sub-bin precision.  Works for both the low modulating tone and the
+    high carrier tone.
+
+    Parameters
+    ----------
+    audio        : input audio (one channel, float array)
+    fs           : sample rate (Hz)
+    f_nominal    : expected frequency (Hz) — centre of search window
+    search_range : half-width of search window (Hz).
+                   Defaults to 5 % of f_nominal, which covers ±3 % speed
+                   error with plenty of margin.
+
+    Returns
+    -------
+    Detected frequency in Hz.  Falls back to f_nominal if detection fails.
+    """
+    if search_range is None:
+        search_range = max(f_nominal * 0.05, 5.0)   # at least ±5 Hz
+
+    # Use the full signal for maximum frequency resolution.
+    # Hann window suppresses spectral leakage from neighbouring tones.
+    N     = len(audio)
+    win   = np.hanning(N)
+    spec  = np.abs(np.fft.rfft(audio * win))
+    freqs = np.fft.rfftfreq(N, 1.0 / fs)
+
+    # Restrict search to window around f_nominal
+    mask  = (freqs >= f_nominal - search_range) & \
+            (freqs <= f_nominal + search_range)
+    if not np.any(mask):
+        return f_nominal   # safety fallback
+
+    # Find peak bin within the search window
+    local_spec          = np.where(mask, spec, 0.0)
+    peak_idx            = int(np.argmax(local_spec))
+
+    # Parabolic interpolation for sub-bin precision
+    if 0 < peak_idx < len(spec) - 1:
+        alpha    = spec[peak_idx - 1]
+        beta     = spec[peak_idx]
+        gamma    = spec[peak_idx + 1]
+        denom    = alpha - 2.0 * beta + gamma
+        if denom != 0.0:
+            correction = 0.5 * (alpha - gamma) / denom
+        else:
+            correction = 0.0
+        bin_width    = freqs[1] - freqs[0]
+        actual_freq  = freqs[peak_idx] + correction * bin_width
+    else:
+        actual_freq  = freqs[peak_idx]
+
+    # Final sanity check — result must stay inside the search window
+    if abs(actual_freq - f_nominal) > search_range:
+        return f_nominal
+
+    return float(actual_freq)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SIDEBAND MEASUREMENT  — AM-IM at carrier ± f_low
+#  Matches REW d2L / d2H values directly.
+#  Uses FFT peak with ±3 bin search + parabolic interpolation.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def measure_sidebands(audio: np.ndarray, fs: float,
+                      f_low: float, f_high: float) -> dict:
+    """
+    Measure first-order AM sidebands at f_high ± f_low using FFT peak.
+
+    Returns dict with:
+      usb_pct   : upper sideband amplitude as % of carrier  (REW d2H equivalent)
+      lsb_pct   : lower sideband amplitude as % of carrier  (REW d2L equivalent)
+      carrier_db: carrier level (dBFS)
+      usb_db    : upper sideband (dBFS)
+      lsb_db    : lower sideband (dBFS)
+      imd_pct   : Bauer IM% = avg(usb_pct, lsb_pct)
+    """
+    N        = len(audio)
+    win      = np.hanning(N)
+    win_corr = 2.0 / np.mean(win)
+    spec     = np.abs(np.fft.rfft(audio * win)) * win_corr / N
+    freqs    = np.fft.rfftfreq(N, 1.0 / fs)
+    bin_hz   = freqs[1]
+
+    def fft_peak(f_target):
+        idx_nom = int(round(f_target / bin_hz))
+        lo      = max(1, idx_nom - 3)
+        hi      = min(len(spec) - 2, idx_nom + 3)
+        idx     = lo + int(np.argmax(spec[lo:hi+1]))
+        a, b, g = spec[idx-1], spec[idx], spec[idx+1]
+        denom   = a - 2*b + g
+        corr    = 0.5*(a-g)/denom if denom != 0 else 0.0
+        return max(float(b + 0.5*corr*(g-a)), 0.0)
+
+    car_v = fft_peak(f_high)
+    usb_v = fft_peak(f_high + f_low)
+    lsb_v = fft_peak(f_high - f_low)
+
+    def _db(v): return float(20*np.log10(max(v, 1e-12)))
+
+    if car_v < 1e-9:
+        return dict(usb_pct=0.0, lsb_pct=0.0, imd_pct=0.0,
+                    carrier_db=-120.0, usb_db=-120.0, lsb_db=-120.0)
+
+    usb_pct = 100.0 * usb_v / car_v
+    lsb_pct = 100.0 * lsb_v / car_v
+    imd_pct = (usb_pct + lsb_pct) / 2.0   # Bauer definition
+
+    return dict(
+        usb_pct    = usb_pct,
+        lsb_pct    = lsb_pct,
+        imd_pct    = imd_pct,
+        carrier_db = _db(car_v),
+        usb_db     = _db(usb_v),
+        lsb_db     = _db(lsb_v),
+    )
+
+
+
 
 def analyse(audio: np.ndarray, fs: float,
             channel: str   = 'L',
@@ -716,42 +883,78 @@ def analyse(audio: np.ndarray, fs: float,
             verbose: bool  = True) -> dict:
     """Run the full patent signal chain on one channel of audio."""
 
-    # ── Input level check ────────────────────────────────────────────────
-    # The input MUST be raw/flat — no RIAA on flat test records.
-    # BPF windows are proportional to f_low and f_high so they work
-    # correctly for all tone pairs (60/200/400 Hz + 4000/7000 Hz)
-    # and are robust to turntable speed errors (wow, drift).
+    # ── Auto-detect actual tone frequencies ──────────────────────────────
+    # Turntable speed error or non-standard cutting frequencies can shift
+    # the actual tones away from their nominal values.  Even a 1 Hz offset
+    # on f_low causes a continuous phase rotation in the chopper reference,
+    # making φ (and therefore HTA/VTA) unreliable.
+    # We detect both tones from the spectrum and use the actual frequencies
+    # everywhere downstream — filters, chopper reference, FM discriminator.
     #
-    # Window widths: ±15% of each tone frequency. This is wide enough
-    # to catch the tone even with >3% turntable speed error, and narrow
-    # enough to reject broadband noise and adjacent harmonics.
-    #
-    # Expected ratio for CBS flat records: V_sv(f_low) / V_sv(f_high)
-    # The ratio depends on the band level and record specification.
-    # For CBS +6dB band both tones have the same groove velocity
-    # so the ratio is 0dB in velocity — but the cartridge output is
-    # proportional to velocity, so the WAV ratio depends on the band.
-    # We use a wide acceptance window (−10 to +30dB) and only warn
-    # on clear RIAA contamination (ratio > 30dB) or missing signal.
+    # Pre-filter before detection to isolate each tone cleanly:
+    #   f_low  : bandpass ±15 % around nominal f_low
+    #   f_high : highpass above f_low×3 to remove the modulating tone
+    _audio_low  = apply(_sos_bp(fs, f_low,  f_low  * 0.30, order=4), audio)
+    _audio_high = apply(_sos_hp(fs, f_low * 3.0,            order=4), audio)
 
-    BW_LOW  = f_low  * 0.30   # ±15% of f_low  — catches ±3% speed error
-    BW_HIGH = f_high * 0.30   # ±15% of f_high — catches ±3% speed error
+    f_low_actual  = detect_actual_frequency(_audio_low,  fs, f_low,
+                                             search_range=f_low  * 0.05)
+    f_high_actual = detect_actual_frequency(_audio_high, fs, f_high,
+                                             search_range=f_high * 0.05)
+
+    if verbose:
+        offset_low  = f_low_actual  - f_low
+        offset_high = f_high_actual - f_high
+        flag_low    = "  ← speed error!" if abs(offset_low)  > 1.0 else ""
+        flag_high   = "  ← speed error!" if abs(offset_high) > 1.0 else ""
+        print(f"  [Freq] f_low  nominal={f_low:.1f} Hz  "
+              f"detected={f_low_actual:.2f} Hz  "
+              f"({offset_low:+.2f} Hz){flag_low}")
+        print(f"  [Freq] f_high nominal={f_high:.1f} Hz  "
+              f"detected={f_high_actual:.2f} Hz  "
+              f"({offset_high:+.2f} Hz){flag_high}")
+
+    # Use detected frequencies for all downstream processing
+    f_low  = f_low_actual
+    f_high = f_high_actual
+
+    # ── Input level check + RIAA phase warning ───────────────────────────
+    # RIAA amplitude effect: shifts f_low/f_high ratio by ~+11 to +15 dB.
+    # More critically, RIAA introduces a PHASE SHIFT of ~50-60° at f_low.
+    # This corrupts the chopper reference (Path B) relative to the FM
+    # deviation signal (Path A), rotating phi and potentially flipping the
+    # sign of HTA/VTA on one channel — verified experimentally:
+    #   With RIAA:    L=-2.8°, R=+3.4°  (opposite signs — WRONG)
+    #   Without RIAA: L=+2.7°, R=+3.4°  (same sign    — CORRECT)
+    # The FM deviation amplitude is RIAA-immune, but the phase is not.
+    # Always record with FLAT/BYPASS preamp for this measurement.
+
+    BW_LOW  = f_low  * 0.30
+    BW_HIGH = f_high * 0.30
 
     e_low  = float(np.std(apply(_sos_bp(fs, f_low,  BW_LOW,  order=4), audio)))
     e_high = float(np.std(apply(_sos_bp(fs, f_high, BW_HIGH, order=4), audio)))
 
+    _riaa_ratio_db = None
+
     if e_high > 0 and e_low > 0:
-        ratio_db = 20.0 * np.log10(e_low / e_high)
-        # RIAA applied to a flat CBS record raises f_low ~+4dB (400Hz) or
-        # ~+8dB (200Hz) and cuts f_high ~-7dB (4kHz), so net ratio shifts
-        # by ~+11 to +15dB. Threshold at +30dB catches this unambiguously.
-        if ratio_db > 30.0:
+        ratio_db       = 20.0 * np.log10(e_low / e_high)
+        _riaa_ratio_db = ratio_db
+        if ratio_db > 20.0:
             warnings.warn(
-                f"\n⚠  POSSIBLE RIAA EQUALIZATION DETECTED  "
-                f"({f_low:.0f}Hz/{f_high:.0f}Hz ratio = {ratio_db:.1f} dB)\n"
-                f"   This may indicate a flat test record was played through\n"
-                f"   a RIAA phono stage. record using your preamp FLAT/BYPASS mode (or use RIAA — both give correct results).\n"
-                f"   re-record using your preamp FLAT/BYPASS mode.",
+                f"\n"
+                f"⚠  POSSIBLE RIAA EQUALIZATION DETECTED\n"
+                f"   {f_low:.0f}Hz / {f_high:.0f}Hz amplitude ratio = {ratio_db:.1f} dB\n"
+                f"\n"
+                f"   RIAA introduces a ~50-60° phase shift at {f_low:.0f}Hz.\n"
+                f"   This corrupts the chopper reference phase (Path B) and\n"
+                f"   can flip the HTA/VTA sign on one channel, giving wrong results:\n"
+                f"\n"
+                f"     With RIAA:    L and R may show OPPOSITE signs  (WRONG)\n"
+                f"     Without RIAA: L and R show the SAME sign       (CORRECT)\n"
+                f"\n"
+                f"   The FM deviation amplitude is RIAA-immune, but phase is not.\n"
+                f"   ACTION: Re-record using your preamp FLAT / BYPASS output.",
                 UserWarning, stacklevel=2)
         elif e_low < 1e-6:
             if verbose:
@@ -763,7 +966,7 @@ def analyse(audio: np.ndarray, fs: float,
                       f"wrong track or input disconnected?")
         else:
             if verbose:
-                status = "OK" if -10 <= ratio_db <= 30 else "CHECK"
+                status = "OK" if -10 <= ratio_db <= 20 else "CHECK"
                 print(f"  [{status}] Input level check: "
                       f"{f_low:.0f}Hz/{f_high:.0f}Hz ratio = {ratio_db:.1f} dB")
     elif verbose:
@@ -783,6 +986,38 @@ def analyse(audio: np.ndarray, fs: float,
 
     # ── Extract F (peak deviation, unsigned) ─────────────────────────────
     F_peak, phi_deg = extract_F_and_phi(dev_signal, audio, fs, f_low)
+
+    # ── Low-F sanity check — catches wrong TONE_PAIR setting ─────────────
+    # If F is near zero despite tones being present, the most likely cause
+    # is that TONE_PAIR does not match the actual record track.
+    # Example: TONE_PAIR='200+4000' set while playing a 400+4000 Hz band —
+    # the 200Hz bandpass finds nothing, the discriminator sees only noise,
+    # and F collapses to < 1 Hz.  The tracing distortion harmonics then
+    # show nonsensical values (including positive dB re fundamental) because
+    # they are computing ratios of noise to noise.
+    # Threshold: 5 Hz is well above the noise floor (~0.5 Hz) but well
+    # below any real tracking/tracing signal (typically 20-200 Hz).
+    _F_MIN_VALID = 5.0   # Hz
+    if F_peak < _F_MIN_VALID and (e_low > 1e-6 and e_high > 1e-6):
+        warnings.warn(
+            f"\n"
+            f"⚠  FM DEVIATION TOO LOW  (channel {channel}: F = {F_peak:.2f} Hz)\n"
+            f"\n"
+            f"   F < {_F_MIN_VALID:.0f} Hz despite both tones being present in the recording.\n"
+            f"   This almost always means TONE_PAIR does not match the actual\n"
+            f"   track on the record.\n"
+            f"\n"
+            f"   Detected tones:  f_low={f_low:.0f} Hz,  f_high={f_high:.0f} Hz\n"
+            f"   Current setting: TONE_PAIR='{TONE_PAIR}' → expects f_low≈{F_MOD:.0f} Hz\n"
+            f"\n"
+            f"   Likely fixes:\n"
+            f"   • Playing a 400+4000 Hz band?  Set TONE_PAIR = '400+4000'\n"
+            f"   • Playing a 200+4000 Hz band?  Set TONE_PAIR = '200+4000'\n"
+            f"   • Custom record?               Set TONE_PAIR = 'custom' and\n"
+            f"                                  CUSTOM_F_MOD to the actual f_low\n"
+            f"\n"
+            f"   VTA/HTA result and tracing distortion plot will be meaningless.",
+            UserWarning, stacklevel=2)
 
     # ── F_signed: sign from most stable segments ──────────────────────────
     # Split into 2-second segments, rank by |DC| magnitude, take mean of
@@ -854,6 +1089,36 @@ def analyse(audio: np.ndarray, fs: float,
             print(f"  [Sign] top-{top_n} segments mean DC={dc_top_mean:+.1f}  "
                   f"{n_correct}/{n_total} segments agree  ({stability})")
 
+    # ── RIAA phase check ─────────────────────────────────────────────────
+    # RIAA phase shift at f_low rotates phi by ~50-60°.  If phi is large
+    # (|phi| > 70°) the real component F·cos(phi) is substantially reduced
+    # and the sign may be flipped relative to a flat recording.
+    # This check fires even when the amplitude ratio didn't trigger the
+    # earlier warning — e.g. RIAA records played through RIAA preamp have
+    # a normal amplitude ratio but still suffer from phase corruption.
+    _phi_riaa_threshold = 70.0
+    if abs(phi_deg) > _phi_riaa_threshold:
+        warnings.warn(
+            f"\n"
+            f"⚠  LARGE PHASE ANGLE DETECTED  (channel {channel}: φ = {phi_deg:+.1f}°)\n"
+            f"\n"
+            f"   |φ| > {_phi_riaa_threshold:.0f}° means the FM deviation and the {f_low:.0f}Hz reference\n"
+            f"   are substantially out of phase.  Most likely causes:\n"
+            f"\n"
+            f"   1. RIAA equalization applied during recording (most common).\n"
+            f"      RIAA introduces ~50-60° phase shift at {f_low:.0f}Hz, rotating\n"
+            f"      φ away from 0° and reducing or inverting the real component.\n"
+            f"      FIX: Re-record with preamp set to FLAT / BYPASS.\n"
+            f"\n"
+            f"   2. High tracing distortion (large imaginary FM component).\n"
+            f"      This is a real physical effect and does not indicate an\n"
+            f"      error — but the HTA/VTA result may still be valid if both\n"
+            f"      channels give the same sign.\n"
+            f"\n"
+            f"   If L and R channels show OPPOSITE signs, cause (1) is likely.\n"
+            f"   If L and R channels show the SAME sign, cause (2) is likely.",
+            UserWarning, stacklevel=2)
+
     # ── VTA computation (patent formula) ─────────────────────────────────
     # The chopper [58] implicitly computes F·cos(φ) by multiplying the
     # deviation signal by the reference square wave — this extracts only
@@ -865,16 +1130,21 @@ def analyse(audio: np.ndarray, fs: float,
     # ── Tracing distortion harmonics ─────────────────────────────────────
     harmonics = tracing_distortion(dev_signal, fs, f_low)
 
+    # ── AM sideband measurement (Bauer AM-IM, REW d2L/d2H equivalent) ────
+    sidebands = measure_sidebands(audio, fs, f_low, f_high)
+
     # ── DC tracking signal (offset-corrected, as meter [62]) ─────────────
     #   offset sets zero-deviation point at θR (16.0° for CBS STR-112)
     meter_reading = vta   # in degrees, directly
 
     results = dict(
-        channel       = channel,
-        modulation    = modulation,
-        f_low         = f_low,
-        f_high        = f_high,
-        fs            = fs,
+        channel          = channel,
+        modulation       = modulation,
+        f_low            = f_low,
+        f_high           = f_high,
+        f_low_nominal    = F_MOD,
+        f_high_nominal   = F_CARRIER,
+        fs               = fs,
         F_peak_hz     = F_peak,
         F_signed_hz   = F_signed,
         phi_deg       = phi_deg,
@@ -891,6 +1161,7 @@ def analyse(audio: np.ndarray, fs: float,
         chopped_trace = chopped_trace,
         dc_trace_sig  = dc_trace_sig,
         audio         = audio,
+        sidebands     = sidebands,    # AM-IM: usb_pct, lsb_pct, imd_pct
     )
 
     if verbose:
@@ -930,59 +1201,76 @@ def analyse(audio: np.ndarray, fs: float,
 
 def generate_test_signal(fs: float = 44100.0,
                          duration: float = 10.0,
-                         vta_error_deg: float = 5.0,
+                         vta_error_deg: float = 6.0,
                          channel: str = 'L',
                          f_low: float  = F_MOD,
                          f_high: float = F_CARRIER,
-                         tracing_frac: float = 0.02) -> np.ndarray:
+                         tracing_frac: float = 0.02,
+                         imd_factor: float = 3.0) -> np.ndarray:
     """
     Synthesize a CBS STR-112-style test signal with a known VTA error injected.
-    Also adds a small quadrature (tracing) component.
 
-    VTA error is encoded as FM deviation F on the f_high carrier:
-        F = V_low * (tan(thetaP) - tan(thetaR)) / (C * R)  where C = 9.1e-4 (vertical) or 8.72e-4 (lateral)
-    (left channel → − sign, so we negate)
+    The signal contains two physically correct components:
+
+    1. FM deviation on the 4kHz carrier — encodes VTA error for the
+       White & Gust FM discriminator method (patent US 4,359,768).
+       This is what compute_vta() reads.
+
+    2. AM sidebands on the 4kHz carrier — encodes Bauer AM-IM distortion.
+       Real groove physics produces both FM and AM simultaneously.
+       The AM level is set using the Bauer exact formula (Eq.24) multiplied
+       by imd_factor to match empirical data (real records show ~3× higher
+       IM% than the pure tracking formula predicts, due to tracing distortion
+       and other groove-stylus interaction effects).
+
+    Parameters
+    ----------
+    vta_error_deg : float  — VTA error above recording angle (degrees)
+    imd_factor    : float  — multiplier on Bauer IM% to match real data
+                             (default 3.0 — calibrated against real STR-111
+                              measurements where 6° error → ~6% IM%)
     """
-    t      = np.arange(int(fs * duration)) / fs
+    t = np.arange(int(fs * duration)) / fs
 
-    # Stereo groove geometry for VERTICAL modulation:
-    # The ch_sign in the analyser is -1 for L, +1 for R.
-    # To produce the correct DC polarity from the chopper, the FM deviation
-    # in the generated signal must be inverted for L relative to R.
-    # ch_sign=-1 for L means the analyser expects NEGATIVE dc for a positive VTA error.
-    # So the L channel groove must produce NEGATIVE FM deviation → groove_sign = -1 for L.
+    # ── Channel polarity ─────────────────────────────────────────────────
     groove_sign = -1.0 if channel.upper() == 'L' else +1.0
 
-    # Compute signed FM deviation for target VTA error.
-    # grove_sign=-1 for L, +1 for R models stereo groove geometry.
-    # F_inj must keep its sign (positive=VTA too steep, negative=too shallow).
-    theta_P = np.radians(RECORDING_ANGLE + vta_error_deg)
-    theta_R = np.radians(RECORDING_ANGLE)
-    # Compute C from formula — same as compute_vta
-    # C = 2π×rpm / (60×f_carrier×cos(θR)) — same formula, θR=0° for lateral
-    C_gen = 2.0*np.pi*TURNTABLE_RPM / (60.0*f_high*np.cos(np.radians(RECORDING_ANGLE)))
-    F_inj   = (PEAK_VEL * (np.tan(theta_P) - np.tan(theta_R))) \
-              / (C_gen * GROOVE_RADIUS)    # signed — keeps direction of error
+    # ── FM deviation — encodes VTA error for discriminator method ─────────
+    # Use a small representative VTA error for FM (the discriminator reads this).
+    # We keep FM small so its sidebands (J1(β) ≈ β/2) don't swamp the AM
+    # sideband measurement. On real records FM and AM coexist at the same
+    # frequencies and cannot be separated by FFT.
+    fm_error_deg = min(vta_error_deg, 1.5)   # cap FM contribution
+    theta_P_fm  = np.radians(RECORDING_ANGLE + fm_error_deg)
+    theta_R     = np.radians(RECORDING_ANGLE)
+    C_gen       = 2.0*np.pi*TURNTABLE_RPM / (60.0*f_high*np.cos(np.radians(RECORDING_ANGLE)))
+    F_inj       = (PEAK_VEL * (np.tan(theta_P_fm) - np.tan(theta_R))) / (C_gen * GROOVE_RADIUS)
 
-    # 400Hz modulating tone (large amplitude — E1)
-    mod_amp  = 0.7
-    mod_tone = mod_amp * np.sin(2*np.pi*f_low*t)
-
-    # 4kHz carrier FM-modulated by VTA error (tracking) and tracing components
-    # groove_sign models stereo geometry: L and R see opposite FM phase
     mod_idx_track = groove_sign * F_inj / f_low
     mod_idx_trace = tracing_frac * abs(mod_idx_track)
 
     carrier_phase = (2*np.pi*f_high*t
-                     + mod_idx_track * np.sin(2*np.pi*f_low*t)       # tracking (VTA error)
-                     + mod_idx_trace * (-np.cos(2*np.pi*f_low*t)))   # tracing (quadrature)
-    # Note: tracing_frac kept very small (default 0.02) so it does not
-    # overwhelm the tracking signal in the chopper DC sign detection.
+                     + mod_idx_track * np.sin(2*np.pi*f_low*t)      # FM tracking
+                     + mod_idx_trace * (-np.cos(2*np.pi*f_low*t)))  # FM tracing
 
-    carrier  = 0.15 * np.cos(carrier_phase)    # 4kHz much smaller amplitude
+    # ── AM sidebands — encodes Bauer IM% ─────────────────────────────────
+    # Bauer exact Eq.24: IM = (v/V)*cos(C)*(tan(A)-tan(C))
+    # Uses full vta_error_deg so the AM level reflects the intended error.
+    # imd_factor accounts for real-world tracing + groove effects (~3×).
+    theta_P_am = np.radians(RECORDING_ANGLE + vta_error_deg)
+    C_rec      = np.radians(RECORDING_ANGLE)
+    vV         = PEAK_VEL / (2*np.pi*GROOVE_RADIUS*(TURNTABLE_RPM/60.0))
+    im_bauer   = vV * np.cos(C_rec) * (np.tan(theta_P_am) - np.tan(theta_R))
+    m_am       = 2.0 * im_bauer * imd_factor   # AM modulation index
+
+    carrier_amp = 0.15
+    carrier     = carrier_amp * (1.0 + m_am * np.cos(2*np.pi*f_low*t)) \
+                  * np.cos(carrier_phase)
+
+    # ── 400Hz modulating tone (E1 reference) ─────────────────────────────
+    mod_tone = 0.7 * np.sin(2*np.pi*f_low*t)
 
     combined = mod_tone + carrier
-    # Normalise
     pk = np.max(np.abs(combined))
     if pk > 0:
         combined /= pk * 1.05
@@ -1052,9 +1340,9 @@ def plot_meter_dashboard(results_list: list,
                          script_name: str = '',
                          wav_name: str = '',
                          description: str = ''):
-    """Meter face (Fig. 5) + harmonics for all analysed results."""
+    """Meter face (Fig. 5) + AM sidebands + harmonics for all analysed results."""
     n    = len(results_list)
-    fig  = plt.figure(figsize=(5*n, 11), facecolor=DARK)
+    fig  = plt.figure(figsize=(5*n, 14), facecolor=DARK)
 
     # ── Main title ────────────────────────────────────────────────────────
     fig.suptitle('Vertical Tracking Angle Meter  —  US Patent 4,359,768',
@@ -1068,55 +1356,72 @@ def plot_meter_dashboard(results_list: list,
     if description:
         info_lines += f"\n{description}"
 
-    fig.text(0.5, 0.935, info_lines,
+    fig.text(0.5, 0.955, info_lines,
              ha='center', va='top', color=ACCENT,
              fontsize=14, fontfamily='monospace',
              bbox=dict(boxstyle='round,pad=0.4', facecolor=MID,
                        edgecolor=GREY, linewidth=0.8))
 
-    # ── Average VTA label (midway between meter circles, yellow background) ─
+    # ── Average VTA label (midway between meter circles) ─────────────────
     if len(results_list) >= 2:
         vta_vals  = [r['vta_deg'] for r in results_list]
         vta_avg   = float(np.mean(vta_vals))
         theta_r_0 = results_list[0]['theta_r_deg']
         err_avg   = vta_avg - theta_r_0
         avg_col   = GREEN if abs(err_avg) < 2 else AMBER if abs(err_avg) < 5 else RED
-        _mode_lbl = "HTA" if any(r.get('modulation','vertical')=='lateral' for r in results_list) else "VTA"
+        _mode_lbl = "HTA" if any(r.get('modulation','vertical')=='lateral'
+                                  for r in results_list) else "VTA"
         avg_label = f"AVG {_mode_lbl}\n{vta_avg:.2f}°\nDev {err_avg:+.2f}°"
-        # Place between the two meter circles (figure coords, midway horizontally,
-        # in the upper half where the polar axes live)
-        fig.text(0.5, 0.545, avg_label,
+        fig.text(0.5, 0.575, avg_label,
                  ha='center', va='center',
                  color='#111111', fontsize=16, fontweight='bold',
                  fontfamily='monospace',
                  bbox=dict(boxstyle='round,pad=0.5',
-                           facecolor='#FFD700',   # yellow
+                           facecolor='#FFD700',
                            edgecolor=avg_col, linewidth=3.0),
                  zorder=20)
 
-    for col_idx, res in enumerate(results_list):
-        gs  = gridspec.GridSpec(2, n, figure=fig,
-                                left=0.05, right=0.97,
-                                top=0.78, bottom=0.05,
-                                hspace=0.35, wspace=0.4,
-                                height_ratios=[1.6, 1.0])
+    # ── Average IM% label (below AVG VTA, above sideband bars) ───────────
+    if len(results_list) >= 1:
+        all_sb = [r.get('sidebands', {}) for r in results_list]
+        pcts   = ([sb.get('usb_pct', 0) for sb in all_sb] +
+                  [sb.get('lsb_pct', 0) for sb in all_sb])
+        pcts   = [p for p in pcts if p > 0]
+        if pcts:
+            avg_imd = float(np.mean(pcts))
+            imd_col = GREEN if avg_imd < 3 else AMBER if avg_imd < 7 else RED
+            fig.text(0.5, 0.390,
+                     f"AVG IM%\n(4 sidebands)\n{avg_imd:.2f}%",
+                     ha='center', va='center',
+                     color='#111111', fontsize=12, fontweight='bold',
+                     fontfamily='monospace',
+                     bbox=dict(boxstyle='round,pad=0.4',
+                               facecolor=imd_col,
+                               edgecolor='#333333', linewidth=2.0),
+                     zorder=20)
 
-        # ── Meter face (top) ──────────────────────────────────────────────
+    # ── GridSpec: 3 rows — meter, sideband bars, harmonic bars ───────────
+    for col_idx, res in enumerate(results_list):
+        gs = gridspec.GridSpec(3, n, figure=fig,
+                               left=0.06, right=0.97,
+                               top=0.84, bottom=0.04,
+                               hspace=0.55, wspace=0.4,
+                               height_ratios=[1.8, 0.9, 0.9])
+
+        # ── Meter face (top row) ──────────────────────────────────────────
         ax_m = fig.add_subplot(gs[0, col_idx], projection='polar')
         ax_m.set_facecolor(MID)
         ax_m.set_theta_direction(-1)
-        ax_m.set_theta_offset(np.pi)         # 0 at top-left
+        ax_m.set_theta_offset(np.pi)
         ax_m.set_ylim(0, 1.15)
         ax_m.set_yticks([])
 
-        # Scale: 5° to 35° mapped to 0°→180° sweep
         vta_min, vta_max = 5.0, 40.0
         vta_range = vta_max - vta_min
 
         def vta_to_rad(v):
             return np.pi * (v - vta_min) / vta_range
 
-        # Coloured arc zones
         zones = [(5, 13, RED), (13, 17, AMBER), (17, 25, GREEN),
                  (25, 33, AMBER), (33, 40, RED)]
         for z0, z1, zcol in zones:
@@ -1124,22 +1429,19 @@ def plot_meter_dashboard(results_list: list,
             ax_m.plot(th, np.ones(60)*1.0, color=zcol, linewidth=8,
                       solid_capstyle='butt', alpha=0.7)
 
-        # Tick marks and labels
         for deg in range(5, 41, 5):
-            th  = vta_to_rad(deg)
+            th = vta_to_rad(deg)
             ax_m.plot([th, th], [0.85, 1.0], color=WHITE, linewidth=0.8)
             ax_m.text(th, 1.12, f'{deg}°', ha='center', va='center',
                       color=WHITE, fontsize=12,
                       rotation=np.degrees(th) - 90)
 
-        # Recording angle marker
         th_r = vta_to_rad(res['theta_r_deg'])
         ax_m.plot([th_r, th_r], [0.75, 1.03], color=ACCENT,
                   linewidth=1.2, linestyle='--', alpha=0.7)
         ax_m.text(th_r, 0.65, f"θR={res['theta_r_deg']}°",
                   ha='center', color=ACCENT, fontsize=12)
 
-        # Needle
         vta_clamped = np.clip(res['vta_deg'], vta_min, vta_max)
         th_n = vta_to_rad(vta_clamped)
         needle_col = GREEN if abs(res['vta_error_deg']) < 2 else \
@@ -1156,28 +1458,68 @@ def plot_meter_dashboard(results_list: list,
             f"F={res['F_peak_hz']:.1f} Hz  φ={res['phi_deg']:+.0f}°",
             color=WHITE, fontsize=12, pad=14)
 
-        # Suppress polar grid clutter
         ax_m.set_rticks([])
         ax_m.set_thetagrids([])
         ax_m.spines['polar'].set_visible(False)
 
-        # ── Tracing distortion harmonics (bottom) ─────────────────────────
-        ax_h = fig.add_subplot(gs[1, col_idx])
+        # ── AM sideband bars (middle row) ─────────────────────────────────
+        ax_s = fig.add_subplot(gs[1, col_idx])
+        ax_s.set_facecolor(MID)
+
+        sb = res.get('sidebands', {})
+        usb_pct = sb.get('usb_pct', 0.0)
+        lsb_pct = sb.get('lsb_pct', 0.0)
+        imd_pct = sb.get('imd_pct', 0.0)
+        f_low_a = res['f_low']
+        f_high_a = res['f_high']
+
+        bar_labels = [f'LSB\n{f_high_a:.0f}−{f_low_a:.0f}',
+                      f'USB\n{f_high_a:.0f}+{f_low_a:.0f}']
+        bar_vals   = [lsb_pct, usb_pct]
+        bar_cols   = ['#00bcd4', '#ff6ec7']   # cyan LSB, pink USB
+
+        bars = ax_s.bar([0, 1], bar_vals, color=bar_cols,
+                        edgecolor=DARK, width=0.5)
+        ax_s.set_xticks([0, 1])
+        ax_s.set_xticklabels(bar_labels, color=WHITE, fontsize=9)
+        ax_s.set_ylabel('% of carrier', color=WHITE, fontsize=9)
+        ax_s.axhline(0, color=WHITE, linewidth=0.4, alpha=0.3)
+
+        # Value labels — inside each bar near the top to avoid overlap
+        for bar, val in zip(bars, bar_vals):
+            ax_s.text(bar.get_x() + bar.get_width()/2,
+                      val * 0.6,
+                      f'{val:.2f}%', ha='center', va='center',
+                      color='#111111', fontsize=9, fontweight='bold')
+
+        # IM% label — below the bars as a subtitle, not overlapping
+        imd_col_s = GREEN if imd_pct < 3 else AMBER if imd_pct < 7 else RED
+        ax_s.text(0.5, -0.22,
+                  f'IM% = {imd_pct:.2f}%  (avg LSB+USB)',
+                  transform=ax_s.transAxes, ha='center', va='top',
+                  color=imd_col_s, fontsize=8, fontweight='bold',
+                  fontfamily='monospace')
+
+        _style_ax(ax_s, f'AM Sidebands — Ch {res["channel"]}  '
+                        f'(d2L={lsb_pct:.2f}%  d2H={usb_pct:.2f}%)')
+
+        # ── Tracing distortion harmonics (bottom row) ─────────────────────
+        ax_h = fig.add_subplot(gs[2, col_idx])
         ax_h.set_facecolor(MID)
         harms  = list(res['harmonics_db'].keys())
         dbvals = [res['harmonics_db'][h] for h in harms]
         cmap   = plt.cm.plasma
         colors = [cmap(h/max(harms)) for h in harms]
         ax_h.bar(harms, dbvals, color=colors, edgecolor=DARK, width=0.6)
-        ax_h.axhline(-20, color=AMBER, linewidth=0.8, linestyle='--', alpha=0.7,
-                     label='−20 dB')
-        ax_h.axhline(-40, color=GREEN, linewidth=0.8, linestyle='--', alpha=0.7,
-                     label='−40 dB')
-        ax_h.set_xlabel('Harmonic', color=WHITE, fontsize=11)
-        ax_h.set_ylabel('dB re fundamental', color=WHITE, fontsize=11)
+        ax_h.axhline(-20, color=AMBER, linewidth=0.8, linestyle='--',
+                     alpha=0.7, label='−20 dB')
+        ax_h.axhline(-40, color=GREEN, linewidth=0.8, linestyle='--',
+                     alpha=0.7, label='−40 dB')
+        ax_h.set_xlabel('Harmonic', color=WHITE, fontsize=9)
+        ax_h.set_ylabel('dB re fundamental', color=WHITE, fontsize=9)
         ax_h.set_xticks(harms)
         ax_h.set_xticklabels([f'{n}×' for n in harms])
-        ax_h.legend(fontsize=10, facecolor=MID, edgecolor=MID,
+        ax_h.legend(fontsize=9, facecolor=MID, edgecolor=MID,
                     labelcolor=WHITE, loc='lower right')
         _style_ax(ax_h, f'Tracing Distortion — {res["f_low"]:.0f}Hz harmonics')
 
