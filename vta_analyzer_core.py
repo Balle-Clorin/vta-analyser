@@ -19,9 +19,8 @@ Software implementation of US Patent 4,359,768 (CBS Inc., 1982)
 "Vertical Tracking Angle Meter" — Abbagnaro & Gust
 Version 5.1 — Auto-detection of actual tone frequencies (fixes turntable speed error / non-standard cutting frequency)
             — RIAA phase warning: amplitude threshold lowered to 20dB, plus phi-based warning for RIAA records played through RIAA preamp
-Version 5.2 — User-configurable reference recording angles RECORDING_ANGLE_VERTICAL / RECORDING_ANGLE_LATERAL
-            — Removes hardcoded 16.5°/0.0° from resolve block; STR-111 support via RECORDING_ANGLE_VERTICAL = 15.0
-            — Low-F sanity check warns when TONE_PAIR does not match actual record track (F < 5 Hz threshold)
+Version 5.3 — Tracing distortion harmonics now measured from raw audio (not FM deviation signal),
+            matching spectrum analyser readings. REV-18.
 
 Signal chain (Fig. 4 of patent):
 
@@ -709,16 +708,25 @@ def extract_F_and_phi(dev_signal: np.ndarray, audio: np.ndarray,
 #  TRACING DISTORTION MEASUREMENT
 # ═════════════════════════════════════════════════════════════════════════════
 
-def tracing_distortion(dev_signal: np.ndarray, fs: float,
+def tracing_distortion(audio: np.ndarray, fs: float,
                        f_low=F_MOD, n_harm=6) -> dict:
     """
-    Measure the amplitude of FM deviation harmonics at n·f_low.
-    These arise from stylus tracing distortion (quadrature component).
+    Measure harmonic distortion of the f_low tone in the RAW audio signal.
+    This matches what a spectrum analyser shows on the 400Hz tone directly,
+    and correctly represents stylus tracing distortion.
+
+    The raw audio is first low-pass filtered below the 4kHz carrier to
+    isolate the f_low tone and its harmonics (all well below 2kHz).
+
     Returns {n: dB_relative_to_fundamental}
     """
-    N      = len(dev_signal)
+    # Low-pass filter to remove 4kHz carrier — keep only f_low and harmonics
+    lp_sos = _sos_lp(fs, min(f_low * (n_harm + 2), fs * 0.4), order=4)
+    audio_lp = apply(lp_sos, audio)
+
+    N      = len(audio_lp)
     freqs  = np.fft.rfftfreq(N, 1/fs)
-    spec   = np.abs(np.fft.rfft(dev_signal * np.hanning(N))) * 2 / N
+    spec   = np.abs(np.fft.rfft(audio_lp * np.hanning(N))) * 2 / N
 
     def peak_bin(fc, bw=20.0):
         mask = (freqs >= fc-bw) & (freqs <= fc+bw)
@@ -1128,7 +1136,8 @@ def analyse(audio: np.ndarray, fs: float,
     vta_err = vta - theta_r
 
     # ── Tracing distortion harmonics ─────────────────────────────────────
-    harmonics = tracing_distortion(dev_signal, fs, f_low)
+    # Measured from raw audio (not dev_signal) — matches spectrum analyser
+    harmonics = tracing_distortion(audio, fs, f_low)
 
     # ── AM sideband measurement (Bauer AM-IM, REW d2L/d2H equivalent) ────
     sidebands = measure_sidebands(audio, fs, f_low, f_high)
