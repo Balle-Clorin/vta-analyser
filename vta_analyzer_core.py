@@ -21,6 +21,8 @@ Version 5.1 — Auto-detection of actual tone frequencies (fixes turntable speed
             — RIAA phase warning: amplitude threshold lowered to 20dB, plus phi-based warning for RIAA records played through RIAA preamp
 Version 5.3 — Tracing distortion harmonics now measured from raw audio (not FM deviation signal),
             matching spectrum analyser readings. REV-18.
+            Sideband measurement: search window widened to ±30 Hz to correctly locate sideband
+            peaks shifted by wow/flutter speed errors (was ±3 bins ~±0.13 Hz — far too narrow).
 
 Signal chain (Fig. 4 of patent):
 
@@ -116,7 +118,7 @@ DEMO_MODE       = False
 # ── Your WAV file (only used when DEMO_MODE = False) ─────────────────────────
 # Windows:   r"C:\Users\YourName\recordings\track2.wav"
 # Mac/Linux: "/home/yourname/recordings/track2.wav"
-AUDIO_FILE      = r"2026 GYRO OC9 CBS STR-112 imd vertical 6db 400-4000.wav"
+AUDIO_FILE      = r"OC9 6DB-V VTF167-AS175.wav"
 
 # ── Calibration mode ─────────────────────────────────────────────────────────
 # Set CALIBRATION_MODE = True to calculate the correct PEAK_VEL for your
@@ -258,7 +260,7 @@ SHOW_SIGNAL_CHAIN = False
 SHOW_METER        = True
 
 # ── Meter description ─────────────────────────────────────────────────────────
-METER_DESCRIPTION = "2026 GYRO OC9 CBS STR-112 SIDE B IMD 6db 400:4k vertical"
+METER_DESCRIPTION = "2026 GYRO OC9 CBS STR-112 SIDE B IMD 6db 400:4k vertical VTF 1G67 AS 175"
 # ── Demo mode only ────────────────────────────────────────────────────────────
 DEMO_VTA_ERROR  = 6.0   # degrees — VTA error injected in demo signal
 #                          6° with imd_factor=3 gives ~6% IM% matching real STR-111 data
@@ -828,6 +830,15 @@ def measure_sidebands(audio: np.ndarray, fs: float,
     """
     Measure first-order AM sidebands at f_high ± f_low using FFT peak.
 
+    Wow and flutter cause the carrier (and its sidebands) to drift during
+    playback. The sideband peaks may therefore sit significantly away from
+    their nominal positions (f_high ± f_low). A fixed ±3-bin search centred
+    on the nominal position will miss the peak and return a falsely low level.
+
+    Fix: search a ±30 Hz window around the nominal sideband frequency to find
+    the true peak, then apply parabolic interpolation on that true peak.
+    30 Hz covers >±0.7% speed error, which is well beyond typical wow levels.
+
     Returns dict with:
       usb_pct   : upper sideband amplitude as % of carrier  (REW d2H equivalent)
       lsb_pct   : lower sideband amplitude as % of carrier  (REW d2L equivalent)
@@ -835,6 +846,8 @@ def measure_sidebands(audio: np.ndarray, fs: float,
       usb_db    : upper sideband (dBFS)
       lsb_db    : lower sideband (dBFS)
       imd_pct   : Bauer IM% = avg(usb_pct, lsb_pct)
+      lsb_found_hz : actual LSB peak frequency found
+      usb_found_hz : actual USB peak frequency found
     """
     N        = len(audio)
     win      = np.hanning(N)
@@ -843,37 +856,50 @@ def measure_sidebands(audio: np.ndarray, fs: float,
     freqs    = np.fft.rfftfreq(N, 1.0 / fs)
     bin_hz   = freqs[1]
 
-    def fft_peak(f_target):
-        idx_nom = int(round(f_target / bin_hz))
-        lo      = max(1, idx_nom - 3)
-        hi      = min(len(spec) - 2, idx_nom + 3)
-        idx     = lo + int(np.argmax(spec[lo:hi+1]))
-        a, b, g = spec[idx-1], spec[idx], spec[idx+1]
-        denom   = a - 2*b + g
-        corr    = 0.5*(a-g)/denom if denom != 0 else 0.0
-        return max(float(b + 0.5*corr*(g-a)), 0.0)
+    SEARCH_HZ = 30.0   # ±30 Hz window — covers >±0.7% speed error
 
-    car_v = fft_peak(f_high)
-    usb_v = fft_peak(f_high + f_low)
-    lsb_v = fft_peak(f_high - f_low)
+    def fft_peak(f_target):
+        """Find true spectral peak within ±SEARCH_HZ of f_target."""
+        lo_f = f_target - SEARCH_HZ
+        hi_f = f_target + SEARCH_HZ
+        mask = (freqs >= lo_f) & (freqs <= hi_f)
+        if not np.any(mask):
+            return 0.0, f_target
+        idx_in_mask = np.argmax(spec[mask])
+        idx = np.where(mask)[0][idx_in_mask]
+        # Parabolic interpolation
+        idx = max(1, min(len(spec) - 2, idx))
+        a, b, g = spec[idx-1], spec[idx], spec[idx+1]
+        denom = a - 2*b + g
+        corr  = 0.5*(a-g)/denom if denom != 0 else 0.0
+        peak_v = max(float(b + 0.5*corr*(g-a)), 0.0)
+        peak_f = freqs[idx] + corr * bin_hz
+        return peak_v, peak_f
+
+    car_v, car_f = fft_peak(f_high)
+    usb_v, usb_f = fft_peak(f_high + f_low)
+    lsb_v, lsb_f = fft_peak(f_high - f_low)
 
     def _db(v): return float(20*np.log10(max(v, 1e-12)))
 
     if car_v < 1e-9:
         return dict(usb_pct=0.0, lsb_pct=0.0, imd_pct=0.0,
-                    carrier_db=-120.0, usb_db=-120.0, lsb_db=-120.0)
+                    carrier_db=-120.0, usb_db=-120.0, lsb_db=-120.0,
+                    lsb_found_hz=f_high-f_low, usb_found_hz=f_high+f_low)
 
     usb_pct = 100.0 * usb_v / car_v
     lsb_pct = 100.0 * lsb_v / car_v
     imd_pct = (usb_pct + lsb_pct) / 2.0   # Bauer definition
 
     return dict(
-        usb_pct    = usb_pct,
-        lsb_pct    = lsb_pct,
-        imd_pct    = imd_pct,
-        carrier_db = _db(car_v),
-        usb_db     = _db(usb_v),
-        lsb_db     = _db(lsb_v),
+        usb_pct      = usb_pct,
+        lsb_pct      = lsb_pct,
+        imd_pct      = imd_pct,
+        carrier_db   = _db(car_v),
+        usb_db       = _db(usb_v),
+        lsb_db       = _db(lsb_v),
+        lsb_found_hz = lsb_f,
+        usb_found_hz = usb_f,
     )
 
 
@@ -888,8 +914,14 @@ def analyse(audio: np.ndarray, fs: float,
             theta_r: float = RECORDING_ANGLE,
             swap_channels: bool = False,
             modulation: str = MODULATION,
-            verbose: bool  = True) -> dict:
-    """Run the full patent signal chain on one channel of audio."""
+            verbose: bool  = True,
+            _demo: bool    = False) -> dict:
+    """Run the full patent signal chain on one channel of audio.
+
+    _demo : suppress the large-phase warning when called from the self-test
+            (the synthesised demo signal has φ≈±90° by construction and would
+            always fire the warning, giving a misleading impression of an error).
+    """
 
     # ── Auto-detect actual tone frequencies ──────────────────────────────
     # Turntable speed error or non-standard cutting frequencies can shift
@@ -1105,7 +1137,7 @@ def analyse(audio: np.ndarray, fs: float,
     # earlier warning — e.g. RIAA records played through RIAA preamp have
     # a normal amplitude ratio but still suffer from phase corruption.
     _phi_riaa_threshold = 70.0
-    if abs(phi_deg) > _phi_riaa_threshold:
+    if abs(phi_deg) > _phi_riaa_threshold and not _demo:
         warnings.warn(
             f"\n"
             f"⚠  LARGE PHASE ANGLE DETECTED  (channel {channel}: φ = {phi_deg:+.1f}°)\n"
@@ -2019,7 +2051,7 @@ if __name__ == '__main__':
     _audio_test = generate_test_signal(fs=44100., vta_error_deg=5.,
                                         channel='L', f_low=400., f_high=4000.)
     _r = analyse(_audio_test, 44100., channel='L', f_low=400., f_high=4000.,
-                 R=0.114, V_low=0.0563, theta_r=16.0, verbose=False)
+                 R=0.114, V_low=0.0563, theta_r=16.0, verbose=False, _demo=True)
     _vta_ok = 18.0 < _r['vta_deg'] < 24.0   # should be ~21 deg
     if _vta_ok:
         print('VTA Analyzer v2.0 — self-test PASSED ✓  Left channel sign is correct')
@@ -2143,7 +2175,8 @@ if __name__ == '__main__':
                       theta_r        = _eff_theta_r,
                       swap_channels  = SWAP_CHANNELS,
                       modulation     = MODULATION,
-                      verbose        = True)
+                      verbose        = True,
+                      _demo          = DEMO_MODE)
         results_all.append(res)
 
     # ── Summary report ────────────────────────────────────────────────────
