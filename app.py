@@ -139,6 +139,21 @@ with st.sidebar:
         else:
             band_opts = ["+6dB", "+9dB", "+12dB"]
         band = st.selectbox("Band level", band_opts)
+        _default_angle = 0.0 if modulation == "lateral" else 16.5
+        rec_angle_cbs  = st.number_input(
+            "Recording angle θR (°)",
+            value=_default_angle,
+            min_value=0.0, max_value=30.0, step=0.1,
+            format="%.1f",
+            help="Default 16.5° (CBS STR-112 vertical, White & Gust 1979). "
+                 "Override here if your record has a different cutting angle."
+        )
+        st.caption(
+            "θR = 16.5° is the vertical recording (cutting) angle measured by Gust "
+            "for the STR-112 record (matrix CLD 445-2), averaged over 11 pickups. "
+            "The lateral/zenith (HTA) channel of the STR-112 was **not** calibrated — "
+            "no reference cutting angle is available for HTA measurement."
+        )
     else:
         modulation   = st.selectbox("Modulation", ["vertical", "lateral"])
         f_mod_custom = st.number_input("Modulating frequency (Hz)", value=400.0,
@@ -191,7 +206,7 @@ def apply_settings():
         _tone_table          = _band_table.get(tone_pair, {})
         core.PEAK_VEL        = _tone_table[band_key]['peak_vel']
         core.GROOVE_RADIUS   = _tone_table[band_key]['groove_radius']
-        core.RECORDING_ANGLE = 0.0 if modulation == 'lateral' else 16.5
+        core.RECORDING_ANGLE = rec_angle_cbs
         core.F_MOD           = 200 if tone_pair == '200+4000' else 400
         core.F_CARRIER       = 4000
     else:
