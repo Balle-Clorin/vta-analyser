@@ -148,12 +148,21 @@ with st.sidebar:
             help="Default 16.5° (CBS STR-112 vertical, White & Gust 1979). "
                  "Override here if your record has a different cutting angle."
         )
-        st.caption(
-            "θR = 16.5° is the vertical recording (cutting) angle measured by Gust "
-            "for the STR-112 record (matrix CLD 445-2), averaged over 11 pickups. "
-            "The lateral/zenith (HTA) channel of the STR-112 was **not** calibrated — "
-            "no reference cutting angle is available for HTA measurement."
-        )
+        if modulation == "vertical":
+            st.caption(
+                "θR = 16.5° is the vertical recording (cutting) angle measured by Gust "
+                "for the STR-112 record (matrix CLD 445-2), averaged over 11 pickups. "
+                "The lateral/zenith (HTA) channel of the STR-112 was **not** calibrated — "
+                "no reference cutting angle is available for HTA measurement."
+            )
+        else:
+            st.caption(
+                "θR = 0.0° is the standard default for lateral (HTA) measurement, "
+                "based on the assumption that the groove was cut with zero zenith angle. "
+                "The STR-112 lateral channel was **not** calibrated by Gust — "
+                "0.0° is a convention, not a measured value. "
+                "Override here if you have a reference angle for your specific record."
+            )
     else:
         modulation   = st.selectbox("Modulation", ["vertical", "lateral"])
         f_mod_custom = st.number_input("Modulating frequency (Hz)", value=400.0,
