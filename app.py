@@ -377,6 +377,16 @@ if app_mode == "📊 Analyse":
             h2_db = res['harmonics_db'].get(2, -120)
             td    = ("✅ Low" if h2_db < -40 else
                      "⚠️ Moderate" if h2_db < -20 else "❌ HIGH")
+            snr_db = res.get('snr_db', None)
+            conf   = res.get('confidence', None)
+            conf_cls = {"HIGH": "green", "MEDIUM": "amber", "LOW": "red"}.get(conf, "muted")
+            conf_html = ""
+            if conf is not None:
+                conf_html = (
+                    f'<div class="muted">Signal confidence: '
+                    f'<span class="{conf_cls}">{conf}</span> '
+                    f'<span class="muted">(SNR {snr_db:.1f} dB)</span></div>'
+                )
             with col:
                 st.markdown(f"""
 <div class="result-card">
@@ -386,12 +396,21 @@ if app_mode == "📊 Analyse":
   <hr style="border-color:#2d3548;margin:0.6rem 0">
   <div class="muted">Peak FM deviation: <span class="accent">{res['F_peak_hz']:.1f} Hz</span></div>
   <div class="muted">Phase φ: <span class="accent">{res['phi_deg']:+.1f}°</span></div>
+  {conf_html}
   <div class="muted">DC tracking: <span class="accent">{res['dc_tracking']:+.4f}</span></div>
   <div class="muted">DC tracing:  <span class="accent">{res['dc_tracing']:+.4f}</span></div>
   <hr style="border-color:#2d3548;margin:0.6rem 0">
   <div class="muted">2nd harmonic: <span class="accent">{h2_db:+.1f} dB</span></div>
   <div class="muted">Tracing distortion: {td}</div>
 </div>""", unsafe_allow_html=True)
+            if conf == "LOW":
+                st.caption(
+                    f"⚠️ Channel {res['channel']}: low signal confidence — this is "
+                    f"expected when VTA is close to the reference angle (FM deviation "
+                    f"is small by design near the null). Apparent L/R disagreement here "
+                    f"is often noise floor, not a real alignment difference. A longer "
+                    f"recording improves confidence."
+                )
 
         theta_r = results_all[0]['theta_r_deg']
         avg_err = float(np.mean([r['vta_error_deg'] for r in results_all]))
