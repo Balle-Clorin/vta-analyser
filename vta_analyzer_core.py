@@ -23,6 +23,20 @@ Version 5.3 — Tracing distortion harmonics now measured from raw audio (not FM
             matching spectrum analyser readings. REV-18.
             Sideband measurement: search window widened to ±30 Hz to correctly locate sideband
             peaks shifted by wow/flutter speed errors (was ±3 bins ~±0.13 Hz — far too narrow).
+Version 5.4 — REV-20. Synchronous (lock-in) I/Q demodulation replaces magnitude/phase-then-median
+            estimation of F and φ. Near the reference angle (θP ≈ θR) the true FM deviation F is
+            small by design, so the old std()-based magnitude estimate (always ≥0, Rayleigh-biased)
+            was dominated by the noise floor rather than the tone — this caused large, spurious
+            L/R VTA disagreement specifically near correct alignment. The lock-in method correlates
+            the deviation signal against sin/cos at the detected f_low over each segment and
+            coherently averages the resulting I/Q phasors (not magnitude+phase separately), which
+            cancels incoherent noise instead of rectifying it, and produces a signed result directly.
+            Reference bandwidth narrowed (was ±60% of f_low, now ±25%, matched to detected frequency)
+            to reduce noise/crosstalk bleed-through. Segment length increased for better coherent
+            averaging. An SNR estimate is now computed from segment-to-segment I/Q scatter and a
+            confidence flag (HIGH/MEDIUM/LOW) is attached to every result and shown on the meter
+            dashboard, so low-SNR near-null readings are flagged rather than silently reported as
+            if they were as reliable as high-SNR readings.
 
 Signal chain (Fig. 4 of patent):
 
@@ -643,67 +657,122 @@ def compute_vta(F_signed_hz: float,
 # ═════════════════════════════════════════════════════════════════════════════
 
 def extract_F_and_phi(dev_signal: np.ndarray, audio: np.ndarray,
-                      fs: float, f_low=F_MOD) -> tuple:
+                      fs: float, f_low=F_MOD,
+                      bw_frac: float = 0.25,
+                      seg_seconds: float = 1.0) -> tuple:
     """
-    Extract peak FM deviation F (Hz) and phase φ (degrees).
+    Extract peak FM deviation F (Hz), phase φ (degrees), and an SNR estimate
+    (dB) using synchronous (lock-in) I/Q demodulation.
 
-    F is recovered from the RMS of the 400Hz band of the deviation signal.
-    φ is the phase lead of E2 (deviation) w.r.t. E1 (400Hz on record).
+    Why lock-in instead of std()+phase-then-median (old method):
+    Near the reference angle (θP ≈ θR) the true FM deviation F is small by
+    design — that's the point of the null. The old estimator took
+    F = sqrt(2)*std(e2) per segment: this is a rectified magnitude, always
+    ≥0 and Rayleigh-biased, so at low true signal it reports the noise floor
+    rather than the tone, independently on each channel. The separately
+    computed phase is then close to meaningless at low SNR. Multiplying that
+    noisy phase back through the sign-recovery logic can turn small L/R
+    noise-floor differences into a large apparent VTA disagreement, even
+    though both channels are near the same true angle.
 
-    In the patent this is done implicitly by the chopper, but we also
-    compute F and φ explicitly so we can apply the VTA formula.
+    Lock-in fix: for each segment, correlate the signal against sin/cos at
+    f_low to get a complex phasor (I + jQ) whose magnitude and phase ARE the
+    amplitude and phase of the f_low component — no separate std()/atan2
+    steps that discard sign information. The e2 phasor is expressed relative
+    to the e1 (record reference tone) phasor, so drift in the absolute phase
+    reference cancels. These per-segment phasors are then averaged as
+    complex numbers (coherent averaging) rather than magnitude-then-median —
+    this suppresses incoherent noise instead of rectifying it, and yields a
+    signed F(=I) and phase directly.
+
+    SNR estimate: the scatter of the per-segment phasors around their mean
+    (in the I/Q plane) is a direct measure of how much of the reported
+    magnitude is noise vs a stable tone. SNR is reported in dB; callers can
+    use it to flag low-confidence results (e.g. near-null VTA readings).
+
+    Returns
+    -------
+    F_peak  : signed-capable peak FM deviation magnitude (Hz) — same
+              convention as before (unsigned magnitude; sign is applied
+              downstream from the chopper DC as before)
+    phi_deg : phase lead of E2 w.r.t. E1 (degrees), in (−180, +180]
+    snr_db  : estimated SNR of the f_low component (dB). Lower = less
+              reliable — useful for flagging near-null readings where L/R
+              channels are prone to disagree.
     """
-    t   = np.arange(len(dev_signal)) / fs
+    t = np.arange(len(dev_signal)) / fs
 
-    # Narrow bandpass around f_low in deviation signal → E2
-    e2  = apply(_sos_bp(fs, f_low, f_low*0.6, order=4), dev_signal)
+    # Narrower reference bandwidth (was ±60% of f_low, now ±25%) — since
+    # f_low is now the auto-detected actual frequency, a tight filter no
+    # longer risks missing the tone, and it excludes more noise/crosstalk.
+    bw = f_low * bw_frac
 
-    # E1: 400Hz from record (path B before axis-crossing)
-    e1_raw = apply(_sos_lp(fs, f_low*3, order=4), audio)
-    e1  = apply(_sos_bp(fs, f_low, f_low*0.6, order=4), e1_raw)
+    e2 = apply(_sos_bp(fs, f_low, bw, order=4), dev_signal)          # E2: FM deviation band
+    e1_raw = apply(_sos_lp(fs, f_low * 3, order=4), audio)
+    e1 = apply(_sos_bp(fs, f_low, bw, order=4), e1_raw)              # E1: record reference tone
 
-    # Peak FM deviation and phase — computed per segment then averaged.
-    # Segmenting over 0.5s windows means:
-    #   - Each segment spans 200 cycles of 400Hz — plenty for stable statistics
-    #   - Wow (0.5-3 Hz) varies slowly across segments; median rejects outliers
-    #   - Flutter residuals that slip through the BPF are averaged down
-    #   - Any single noisy segment (e.g. a tick or pop) is rejected by median
-    seg_len = max(int(fs * 0.5), int(fs / f_low) * 20)  # at least 20 cycles
+    # Longer segments (1.0 s vs 0.5 s) for better coherent averaging per
+    # segment, while still short enough that slow wow (0.5-3 Hz) doesn't
+    # smear the phase reference within a single segment.
+    seg_len = max(int(fs * seg_seconds), int(fs / f_low) * 20)  # ≥20 cycles
     n_segs  = max(1, len(e2) // seg_len)
 
-    F_segs    = []
-    phi_segs  = []
+    I_list, Q_list = [], []
 
     for i in range(n_segs):
-        sl   = slice(i * seg_len, (i + 1) * seg_len)
-        e2s  = e2[sl]
-        e1s  = e1[sl]
-        ts   = t[sl]
+        sl  = slice(i * seg_len, (i + 1) * seg_len)
+        e2s = e2[sl]
+        e1s = e1[sl]
+        ts  = t[sl]
+        N   = len(e2s)
+        if N == 0:
+            continue
 
-        # F_peak for this segment
-        F_segs.append(np.sqrt(2.0) * float(np.std(e2s)))
+        rc = np.cos(2 * np.pi * f_low * ts)
+        rs = np.sin(2 * np.pi * f_low * ts)
 
-        # Phase for this segment via phasor correlation
-        rc = np.cos(2*np.pi*f_low*ts)
-        rs = np.sin(2*np.pi*f_low*ts)
-        ph_e1 = np.angle(complex(np.dot(e1s, rc), np.dot(e1s, rs)))
-        ph_e2 = np.angle(complex(np.dot(e2s, rc), np.dot(e2s, rs)))
-        phi_segs.append(float(np.degrees(ph_e2 - ph_e1)))
+        # Complex phasors at f_low: X = (2/N)*sum(x*(rc - j*rs))
+        # magnitude ≈ peak amplitude of the f_low component; angle = its phase.
+        X2 = (2.0 / N) * (np.dot(e2s, rc) - 1j * np.dot(e2s, rs))
+        X1 = (2.0 / N) * (np.dot(e1s, rc) - 1j * np.dot(e1s, rs))
 
-    # Median across segments — robust against wow-induced outliers and clicks
-    F_peak  = float(np.median(F_segs))
+        # Express E2 phasor relative to E1's phase — this removes any
+        # common absolute-phase drift/uncertainty in the reference and
+        # gives exactly the "phase lead of E2 w.r.t. E1" the formula wants.
+        mag_e1 = abs(X1)
+        if mag_e1 > 1e-12:
+            rel = X2 * np.conj(X1) / mag_e1     # |rel| = |X2|, angle = angle(X2)-angle(X1)
+        else:
+            rel = X2
 
-    # Circular median for phase (handles ±180° wrap correctly)
-    phi_rad_segs = np.radians(phi_segs)
-    phi_deg = float(np.degrees(np.arctan2(
-        np.median(np.sin(phi_rad_segs)),
-        np.median(np.cos(phi_rad_segs))
-    )))
+        I_list.append(rel.real)
+        Q_list.append(rel.imag)
 
-    # Normalise to (−180, +180]
-    phi_deg = (phi_deg + 180) % 360 - 180
+    I_arr = np.array(I_list) if I_list else np.array([0.0])
+    Q_arr = np.array(Q_list) if Q_list else np.array([0.0])
 
-    return F_peak, phi_deg
+    # Coherent averaging: mean of the complex phasors, not of their magnitudes.
+    # A stable tone with consistent phase adds constructively across segments;
+    # random noise phasors partially cancel instead of always adding positively.
+    I_mean = float(np.mean(I_arr))
+    Q_mean = float(np.mean(Q_arr))
+
+    F_peak  = float(np.hypot(I_mean, Q_mean))
+    phi_deg = float(np.degrees(np.arctan2(Q_mean, I_mean)))
+    phi_deg = (phi_deg + 180) % 360 - 180   # normalise to (−180, +180]
+
+    # ── SNR estimate from segment-to-segment phasor scatter ──────────────
+    # Residual scatter of each segment's phasor around the coherent mean is
+    # the noise contribution; its magnitude relative to F_peak gives SNR.
+    # Using standard-error-of-the-mean (scatter / sqrt(n)) reflects that
+    # averaging more segments genuinely improves confidence in the mean.
+    n_segs_eff = max(len(I_arr), 1)
+    resid = np.hypot(I_arr - I_mean, Q_arr - Q_mean)
+    noise_est = float(np.std(resid)) / np.sqrt(n_segs_eff) if n_segs_eff > 1 else float(np.std(resid))
+    noise_est = max(noise_est, 1e-6)
+    snr_db = float(20.0 * np.log10(max(F_peak, 1e-6) / noise_est))
+
+    return F_peak, phi_deg, snr_db
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1025,7 +1094,37 @@ def analyse(audio: np.ndarray, fs: float,
     dc_trace, chopped_trace, dc_trace_sig = chopper_lpf(dev_signal, sq_trace, fs, f_low)
 
     # ── Extract F (peak deviation, unsigned) ─────────────────────────────
-    F_peak, phi_deg = extract_F_and_phi(dev_signal, audio, fs, f_low)
+    F_peak, phi_deg, snr_db = extract_F_and_phi(dev_signal, audio, fs, f_low)
+
+    # ── Confidence flag from SNR ──────────────────────────────────────────
+    # Readings near the reference angle (F small by design) are inherently
+    # more susceptible to noise-floor bias. Flag rather than silently trust.
+    #   HIGH   : snr_db >= 12 dB  — reading is well above the noise floor
+    #   MEDIUM : 6 <= snr_db < 12 — usable, but treat small VTA errors with
+    #            caution, especially if L/R disagree
+    #   LOW    : snr_db < 6       — F is comparable to the noise floor;
+    #            the reported VTA/angle for this channel may not be reliable
+    if snr_db >= 12.0:
+        confidence = 'HIGH'
+    elif snr_db >= 6.0:
+        confidence = 'MEDIUM'
+    else:
+        confidence = 'LOW'
+
+    if confidence == 'LOW' and verbose:
+        warnings.warn(
+            f"\n"
+            f"⚠  LOW SIGNAL CONFIDENCE  (channel {channel}: SNR = {snr_db:.1f} dB)\n"
+            f"\n"
+            f"   The FM deviation F = {F_peak:.2f} Hz is close to the noise floor for\n"
+            f"   this channel — this is EXPECTED when the cartridge VTA is close to\n"
+            f"   the reference angle θR, since F is small by design near the null.\n"
+            f"\n"
+            f"   This is the most common cause of L and R channels appearing to\n"
+            f"   disagree strongly even though both are near the correct angle.\n"
+            f"   Treat this channel's reading as approximate; a longer recording\n"
+            f"   (more segments to average) will improve confidence.",
+            UserWarning, stacklevel=2)
 
     # ── Low-F sanity check — catches wrong TONE_PAIR setting ─────────────
     # If F is near zero despite tones being present, the most likely cause
@@ -1189,6 +1288,8 @@ def analyse(audio: np.ndarray, fs: float,
         F_peak_hz     = F_peak,
         F_signed_hz   = F_signed,
         phi_deg       = phi_deg,
+        snr_db        = snr_db,
+        confidence    = confidence,
         vta_deg       = vta,
         vta_error_deg = vta_err,
         theta_r_deg   = theta_r,
@@ -1214,6 +1315,7 @@ def analyse(audio: np.ndarray, fs: float,
         print(f"║  Peak FM deviation (F)    : {F_peak:8.2f} Hz             ║")
         print(f"║  Signed FM deviation      : {F_signed:+8.2f} Hz             ║")
         print(f"║  Phase lead E2/E1 (φ)     : {phi_deg:+8.1f}°             ║")
+        print(f"║  SNR / confidence         : {snr_db:6.1f} dB  ({confidence:<6})     ║")
         _anglbl = "Horiz Tracking Angle " if modulation == "lateral" else "Vertical Tracking Angle"
         print(f"║  {_anglbl}  : {vta:8.2f}°             ║")
         _errlbl = "HTA" if modulation == "lateral" else "VTA"
@@ -1493,11 +1595,18 @@ def plot_meter_dashboard(results_list: list,
         ax_m.plot(0, 0, 'o', color=WHITE, markersize=5, zorder=10)
 
         _m_lbl = "HTA" if res.get('modulation','vertical') == 'lateral' else "VTA"
+        _conf  = res.get('confidence', None)
+        _conf_col = {'HIGH': GREEN, 'MEDIUM': AMBER, 'LOW': RED}.get(_conf, WHITE)
+        _conf_str = f"  SNR={res.get('snr_db', 0):.0f}dB ({_conf})" if _conf else ""
         ax_m.set_title(
             f"Ch {res['channel']}  {res['f_low']:.0f}/{res['f_high']:.0f} Hz\n"
             f"{_m_lbl} = {res['vta_deg']:.1f}°  (err {res['vta_error_deg']:+.1f}°)\n"
             f"F={res['F_peak_hz']:.1f} Hz  φ={res['phi_deg']:+.0f}°",
             color=WHITE, fontsize=12, pad=14)
+        if _conf:
+            ax_m.text(0.5, -0.14, _conf_str.strip(), transform=ax_m.transAxes,
+                      ha='center', va='top', color=_conf_col,
+                      fontsize=10, fontweight='bold')
 
         ax_m.set_rticks([])
         ax_m.set_thetagrids([])
@@ -1979,8 +2088,18 @@ def print_summary(results_list: list):
 
     for r in results_list:
         _lbl = "HTA" if r.get('modulation','vertical') == 'lateral' else "VTA"
+        _conf = r.get('confidence', '?')
+        _snr  = r.get('snr_db', 0.0)
         print(f"║  Channel {r['channel']}: {_lbl} = {r['vta_deg']:6.2f}°  "
-              f"(error {r['vta_error_deg']:+.2f}°)         ║")
+              f"(error {r['vta_error_deg']:+.2f}°)  SNR {_snr:5.1f}dB [{_conf}] ║")
+
+    _low_conf_chs = [r['channel'] for r in results_list if r.get('confidence') == 'LOW']
+    if _low_conf_chs:
+        print(f"╠══════════════════════════════════════════════════════╣")
+        print(f"║  ⚠ LOW confidence on channel(s): {', '.join(_low_conf_chs):<20}║")
+        print(f"║  This is expected near correct VTA (F is small by     ║")
+        print(f"║  design there) — apparent L/R disagreement is often   ║")
+        print(f"║  noise-floor, not a real alignment difference.        ║")
 
     if len(vta_values) == 2:
         vta_avg = float(np.mean(vta_values))
