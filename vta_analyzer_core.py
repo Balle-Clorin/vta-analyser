@@ -37,6 +37,23 @@ Version 5.4 — REV-20. Synchronous (lock-in) I/Q demodulation replaces magnitud
             confidence flag (HIGH/MEDIUM/LOW) is attached to every result and shown on the meter
             dashboard, so low-SNR near-null readings are flagged rather than silently reported as
             if they were as reliable as high-SNR readings.
+Version 5.5 — REV-21. F_signed now derived directly from the chopper+LPF DC value
+            (dc_track), the actual patent hardware quantity (block 58/60, Fig. 4) —
+            a synchronous square-wave detector with a ~40-cycle (~0.1s at 400Hz) LPF
+            time constant (f_low/40 cutoff, chopper_lpf). This matches the fast-
+            response philosophy of White & Gust's original analog phasemeter/
+            voltmeter setup (see their precaution #3: they ignored click-induced
+            meter jumps rather than averaging through them) and is far less
+            susceptible to wow/flutter decorrelation than REV-20's 1.0s coherent
+            I/Q lock-in, since a 0.1s window covers only a fraction of a typical
+            0.5-3Hz wow cycle. Previously dc_track contributed only its *sign*
+            (via dc_sign_robust) while F_peak (the segment-length-sensitive lock-in
+            magnitude) supplied the magnitude — this decoupling is removed.
+            dc_track is scaled by pi/2 to convert the square-wave synchronous-
+            detector average back to the equivalent peak F*cos(phi) quantity the
+            compute_vta formula expects. F_peak/phi_deg/snr_db from REV-20's
+            lock-in are retained as diagnostic output only and no longer feed
+            into the VTA/HTA calculation.
 
 Signal chain (Fig. 4 of patent):
 
@@ -1213,20 +1230,29 @@ def analyse(audio: np.ndarray, fs: float,
         ch_is_left = not ch_is_left
     _is_lateral = (modulation == "lateral")
     ch_sign     = +1.0 if _is_lateral else (-1.0 if ch_is_left else +1.0)
-    F_signed    = ch_sign * dc_sign_robust * F_peak
+
+    # ── F_signed: REV-21 — derived directly from the chopper+LPF DC value ──
+    # dc_track IS the patent hardware quantity (block 58/60): a synchronous
+    # square-wave detector with a ~0.1s (40-cycle) LPF time constant, far
+    # shorter than the 1.0s lock-in window used for F_peak/phi/SNR above and
+    # much less prone to wow/flutter decorrelation. Chopping a sinusoid of
+    # amplitude F and phase phi by a ±1 square wave and low-pass filtering
+    # yields an average of (2/pi)*F*cos(phi) (fundamental of the square
+    # wave's Fourier series). Multiply by pi/2 to recover F*cos(phi)
+    # directly — exactly the real-component quantity compute_vta expects,
+    # with no separate cos(phi) correction needed.
+    F_signed = ch_sign * dc_track * (np.pi / 2.0)
 
     if verbose:
         n_total   = len(dc_segs)
-        n_correct = sum(1 for d in dc_segs if np.sign(d) == dc_sign_robust)
+        n_correct = sum(1 for d in dc_segs if np.sign(d) == np.sign(dc_track))
         top_n     = max(1, n_total // 2)
-        if n_total == 0:
-            print(f"  [Sign] using overall DC={dc_top_mean:+.1f}  "
-                  f"(signal too short for segment analysis)")
-        else:
-            stability = 'stable' if n_total == 0 or n_correct/n_total > 0.6 \
-                        else 'check recording'
-            print(f"  [Sign] top-{top_n} segments mean DC={dc_top_mean:+.1f}  "
-                  f"{n_correct}/{n_total} segments agree  ({stability})")
+        print(f"  [F_signed] from dc_track={dc_track:+.2f}  "
+              f"(x pi/2 = {dc_track*np.pi/2:+.2f} Hz real component)")
+        if n_total > 0:
+            stability = 'stable' if n_correct/n_total > 0.6 else 'check recording'
+            print(f"  [Sign check] top-{top_n} 2s-segments: "
+                  f"{n_correct}/{n_total} agree with overall dc_track sign  ({stability})")
 
     # ── RIAA phase check ─────────────────────────────────────────────────
     # RIAA phase shift at f_low rotates phi by ~50-60°.  If phi is large
