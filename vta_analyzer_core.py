@@ -1627,7 +1627,7 @@ def plot_meter_dashboard(results_list: list,
         ax_m.set_title(
             f"Ch {res['channel']}  {res['f_low']:.0f}/{res['f_high']:.0f} Hz\n"
             f"{_m_lbl} = {res['vta_deg']:.1f}°  (err {res['vta_error_deg']:+.1f}°)\n"
-            f"F={res['F_peak_hz']:.1f} Hz  φ={res['phi_deg']:+.0f}°",
+            f"F={abs(res['F_signed_hz']):.1f} Hz  φ={res['phi_deg']:+.0f}°",
             color=WHITE, fontsize=12, pad=14)
         if _conf:
             ax_m.text(0.5, -0.14, _conf_str.strip(), transform=ax_m.transAxes,

@@ -394,10 +394,10 @@ if app_mode == "📊 Analyse":
   <div class="metric-big {cls}">{res['vta_deg']:.2f}°</div>
   <div class="muted">{ang_label} &nbsp;·&nbsp; err <span class="{cls}">{err:+.2f}°</span></div>
   <hr style="border-color:#2d3548;margin:0.6rem 0">
-  <div class="muted">Peak FM deviation: <span class="accent">{res['F_peak_hz']:.1f} Hz</span></div>
-  <div class="muted">Phase φ: <span class="accent">{res['phi_deg']:+.1f}°</span></div>
+  <div class="muted">Peak FM deviation (lock-in diag.): <span class="accent">{res['F_peak_hz']:.1f} Hz</span></div>
+  <div class="muted">Phase φ (lock-in diag.): <span class="accent">{res['phi_deg']:+.1f}°</span></div>
   {conf_html}
-  <div class="muted">DC tracking: <span class="accent">{res['dc_tracking']:+.4f}</span></div>
+  <div class="muted">DC tracking (drives VTA): <span class="accent">{res['dc_tracking']:+.4f}</span>  →  |F_signed|={abs(res['F_signed_hz']):.1f} Hz</div>
   <div class="muted">DC tracing:  <span class="accent">{res['dc_tracing']:+.4f}</span></div>
   <hr style="border-color:#2d3548;margin:0.6rem 0">
   <div class="muted">2nd harmonic: <span class="accent">{h2_db:+.1f} dB</span></div>
