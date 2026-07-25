@@ -1262,7 +1262,15 @@ def analyse(audio: np.ndarray, fs: float,
     # earlier warning — e.g. RIAA records played through RIAA preamp have
     # a normal amplitude ratio but still suffer from phase corruption.
     _phi_riaa_threshold = 70.0
-    if abs(phi_deg) > _phi_riaa_threshold and not _demo:
+    # Distance from the NEAREST real axis (0 deg OR 180 deg / -180 deg).
+    # phi near 180 deg is just as "real" (anti-phase, cos(phi)=-1) as phi
+    # near 0 deg -- only phi near +/-90 deg indicates a genuinely large
+    # imaginary (tracing) component. Previously this compared abs(phi_deg)
+    # directly to the threshold, which incorrectly flagged clean anti-phase
+    # readings (e.g. phi=-177.5 deg, only 2.5 deg from pure real) as if they
+    # were near-quadrature (RIAA-corrupted or high-tracing-distortion).
+    _phi_dist_from_real = abs(((phi_deg + 90.0) % 180.0) - 90.0)
+    if _phi_dist_from_real > _phi_riaa_threshold and not _demo:
         warnings.warn(
             f"\n"
             f"⚠  LARGE PHASE ANGLE DETECTED  (channel {channel}: φ = {phi_deg:+.1f}°)\n"
