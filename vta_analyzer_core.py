@@ -54,6 +54,29 @@ Version 5.5 — REV-21. F_signed now derived directly from the chopper+LPF DC va
             compute_vta formula expects. F_peak/phi_deg/snr_db from REV-20's
             lock-in are retained as diagnostic output only and no longer feed
             into the VTA/HTA calculation.
+Version 5.6 — REV-22. Two dashboard/warning fixes, no change to the VTA calculation itself:
+            1) Dashboard "F=" label was showing F_peak_hz (the REV-20 lock-in
+               diagnostic) instead of F_signed_hz (what REV-21 actually uses to
+               compute VTA) -- corrected to show abs(F_signed_hz) so the number
+               on screen matches what drove the displayed angle.
+            2) The "LARGE PHASE ANGLE" warning compared abs(phi_deg) to a 70 deg
+               threshold, measuring distance from 0 deg only. phi near 180 deg
+               (anti-phase) is just as "real" (cos(phi)=-1) as phi near 0 deg --
+               only phi near +/-90 deg indicates genuine quadrature/tracing
+               content. Fixed to measure distance from the *nearest* real axis
+               (0 or +/-180 deg), eliminating false positives on clean anti-phase
+               recordings (e.g. phi=-177.5 deg was incorrectly flagged before).
+Version 5.7 — REV-23. Fixed a memory leak: analyse()'s result dict was storing
+            7 full-length signal arrays per channel per track (audio, dev_signal,
+            sq_track, chopped_track/trace, dc_track_sig/trace_sig) even though
+            only the first ~25ms of each is ever used (plot_signal_chain's
+            snippet plot) -- for a multi-minute track this is roughly 1GB
+            retained *per result*. A batch script accumulating results across
+            many tracks would grow memory unboundedly and eventually fail with
+            "bad allocation" partway through a long run. All 7 arrays are now
+            trimmed to 50ms before being returned. No effect on any calculated
+            value (VTA, F_signed, phi, SNR, etc.) -- confirmed identical output
+            before and after on the same test file.
 
 Signal chain (Fig. 4 of patent):
 
@@ -1311,6 +1334,8 @@ def analyse(audio: np.ndarray, fs: float,
     #   offset sets zero-deviation point at θR (16.0° for CBS STR-112)
     meter_reading = vta   # in degrees, directly
 
+    _snip = int(fs * 0.05)   # 50ms -- double what plot_signal_chain actually uses
+
     results = dict(
         channel          = channel,
         modulation       = modulation,
@@ -1330,13 +1355,18 @@ def analyse(audio: np.ndarray, fs: float,
         dc_tracking   = dc_track,
         dc_tracing    = dc_trace,
         harmonics_db  = harmonics,
-        dev_signal    = dev_signal,
-        sq_track      = sq_track,
-        chopped_track = chopped_track,
-        dc_track_sig  = dc_track_sig,
-        chopped_trace = chopped_trace,
-        dc_trace_sig  = dc_trace_sig,
-        audio         = audio,
+        # Only ~25ms of these is ever used (plot_signal_chain snippet plot).
+        # Trim before returning -- storing full-length arrays here retains
+        # ~7 full-length float64 copies per channel per track, which for a
+        # multi-minute track is on the order of 1GB *per result*. In a batch
+        # loop that accumulates results across tracks, this grows unboundedly.
+        dev_signal    = dev_signal[:_snip],
+        sq_track      = sq_track[:_snip],
+        chopped_track = chopped_track[:_snip],
+        dc_track_sig  = dc_track_sig[:_snip],
+        chopped_trace = chopped_trace[:_snip],
+        dc_trace_sig  = dc_trace_sig[:_snip],
+        audio         = audio[:_snip],
         sidebands     = sidebands,    # AM-IM: usb_pct, lsb_pct, imd_pct
     )
 
@@ -1522,7 +1552,7 @@ def plot_meter_dashboard(results_list: list,
     fig  = plt.figure(figsize=(5*n, 14), facecolor=DARK)
 
     # ── Main title ────────────────────────────────────────────────────────
-    fig.suptitle('Vertical Tracking Angle Meter  —  US Patent 4,359,768',
+    fig.suptitle('Vertical Tracking Angle Meter  —  US Patent 4,359,768 rev23',
                  color=WHITE, fontsize=16, fontweight='bold', y=0.98)
 
     # ── Info banner: script / WAV / description ───────────────────────────
