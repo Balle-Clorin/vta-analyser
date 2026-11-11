@@ -7,6 +7,7 @@ Run with:
     streamlit run app.py
 """
 
+import contextlib
 import gc
 import io
 import os
@@ -100,15 +101,31 @@ def load_core():
 core = load_core()
 
 # ── Memory cleanup helper ─────────────────────────────────────────────────────
-def cleanup_memory(*arrays):
-    """Delete numpy arrays and force garbage collection."""
-    for arr in arrays:
-        try:
-            del arr
-        except Exception:
-            pass
-    plt.close('all')   # close any stray matplotlib figures
+def release_memory():
+    """Close figures, collect garbage and hand freed heap pages back to the OS.
+
+    (The old cleanup_memory() did `del arr` on its own argument names, which
+    frees nothing, and it was never called.)  numpy frees big arrays promptly,
+    but glibc keeps much of the freed heap, so the server process stays several
+    hundred MB larger than it needs to be after every analysis and the next run
+    starts from that higher floor.  malloc_trim(0) gives it back.
+    """
+    plt.close('all')
     gc.collect()
+    if sys.platform.startswith('linux'):
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass   # not glibc -- nothing to do
+
+
+def show_fig(fig):
+    """Render a matplotlib figure and always close it, even if rendering fails."""
+    try:
+        st.pyplot(fig, use_container_width=True)
+    finally:
+        plt.close(fig)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SIDEBAR
@@ -186,6 +203,12 @@ with st.sidebar:
                                     min_value=16.0, max_value=78.0, step=0.001,
                                     format="%.3f")
     apply_riaa    = st.checkbox("Apply inverse RIAA correction", value=False)
+    fft_trim      = st.checkbox(
+        "Memory saver (trim <=1% off the end)", value=True,
+        help="A recording whose length has a large prime factor makes every full-length FFT "
+             "several times slower and about twice as memory-hungry (a 3-minute track can "
+             "need more than 1.5 GB). Dropping the last ~0.1 s (never more than 1 %) avoids "
+             "that. VTA/HTA change by less than 0.0001 deg. Untick to analyse every sample.")
 
     st.divider()
 
@@ -239,29 +262,24 @@ def load_wav(uploaded_file):
                  "Run: `pip install soundfile` then restart the app.")
         st.stop()
 
-    raw = uploaded_file.read()
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(raw)
-            tmp_path = tmp.name
-        del raw   # free the raw bytes immediately
-        gc.collect()
-
-        data, fs = sf.read(tmp_path, always_2d=True)
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
-    pk = np.max(np.abs(data))
-    if pk > 0:
-        data = data / pk
+    # Read straight from the upload buffer: no temp file and no second copy of
+    # the bytes (uploaded_file.read() + temp-file round trip before).
+    # float32 holds 16/24-bit PCM exactly and halves the footprint of the
+    # decoded audio; the analysis filters work in float64 internally.
+    uploaded_file.seek(0)
+    data, fs = sf.read(uploaded_file, always_2d=True, dtype='float32')
 
     if apply_riaa:
-        data = core.apply_inverse_riaa(data, fs)
-        pk2  = np.max(np.abs(data))
-        if pk2 > 0:
-            data = data / pk2
+        # one channel at a time -- filtering the whole stereo array at once
+        # costs several full-length float64 copies
+        for c in range(data.shape[1]):
+            data[:, c] = core.apply_inverse_riaa(data[:, c].astype(np.float64), fs)
+
+    # Peak-normalise in place (data / pk would allocate a full second copy;
+    # np.max(np.abs(data)) also built a full temporary).
+    pk = max(float(data.max()), -float(data.min()))
+    if pk > 0:
+        data /= pk
 
     return data, fs
 
@@ -328,13 +346,14 @@ if app_mode == "📊 Analyse":
                 del data   # free the full stereo array — we only need per-channel slices
                 gc.collect()
 
+        n_loaded    = len(next(iter(audio_map.values())))
         results_all = []
         progress    = st.progress(0, text="Analysing…")
 
         for i, (ch, audio) in enumerate(audio_map.items()):
             progress.progress(i / len(audio_map), text=f"Analysing channel {ch}…")
-            old_out = sys.stdout; sys.stdout = io.StringIO()
-            with warnings.catch_warnings(record=True) as caught_warns:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 warnings.catch_warnings(record=True) as caught_warns:
                 warnings.simplefilter("always")
                 res = core.analyse(
                     audio, fs,
@@ -343,8 +362,9 @@ if app_mode == "📊 Analyse":
                     theta_r=core.RECORDING_ANGLE,
                     swap_channels=swap_channels,
                     modulation=core.MODULATION, verbose=True,
+                    sign_check=False,   # diagnostic-only pass: skipped (it re-ran the whole chain)
+                    fft_trim=fft_trim,  # sidebar: FFT-friendly length -> far less memory, much faster
                 )
-            sys.stdout = old_out
             results_all.append(res)
             for w in caught_warns:
                 if issubclass(w.category, UserWarning):
@@ -352,6 +372,7 @@ if app_mode == "📊 Analyse":
 
         progress.progress(1.0, text="Done ✓")
 
+        audio = None   # the loop variable still points at the last channel's array
         ang_label = "HTA" if core.MODULATION == 'lateral' else "VTA"
         st.divider()
         st.subheader(f"📊 {ang_label} Results — {wav_name}")
@@ -430,29 +451,24 @@ if app_mode == "📊 Analyse":
             results_all, script_name="vta_analyzer_core.py",
             wav_name=wav_name, description="",
         )
-        st.pyplot(fig_meter, use_container_width=True)
-        plt.close(fig_meter)
+        show_fig(fig_meter)
 
         if show_spectrum:
             st.subheader("📈 Spectrum")
             fig_spec = core.plot_spectrum(audio_map, fs,
                                           f_low=core.F_MOD, f_high=core.F_CARRIER)
-            st.pyplot(fig_spec, use_container_width=True)
-            plt.close(fig_spec)
+            show_fig(fig_spec)
 
         # Free audio data — no longer needed after spectrum plot
         del audio_map
-        gc.collect()
 
         if show_chain:
             st.subheader("🔗 Patent Signal Chain")
             fig_chain = core.plot_signal_chain(results_all[0])
-            st.pyplot(fig_chain, use_container_width=True)
-            plt.close(fig_chain)
+            show_fig(fig_chain)
 
         # Final cleanup — release results and any remaining figure memory
-        plt.close('all')
-        gc.collect()
+        release_memory()
 
         with st.expander("⚙️ Settings used for this run"):
             r0 = results_all[0]
@@ -470,7 +486,10 @@ if app_mode == "📊 Analyse":
                 f"Channel     : {channel}\n"
                 f"Swap L/R    : {swap_channels}\n"
                 f"Inv RIAA    : {apply_riaa}\n"
-                f"Sample rate : {r0['fs']:.0f} Hz",
+                f"Sample rate : {r0['fs']:.0f} Hz\n"
+                f"Samples     : {r0['n_samples']} analysed of {n_loaded} "
+                f"(end trimmed {(n_loaded - r0['n_samples']) / r0['fs']:.2f} s "
+                f"to an FFT-friendly length)",
                 language="text",
             )
 
@@ -558,14 +577,12 @@ Two methods are available — run both when possible:
 
         with st.spinner("Running calibration — this may take 20–30 seconds…"):
             # Write WAV to temp file (calibrate_peak_vel needs a file path)
-            raw = uploaded_cal.read()
             tmp_path = None
             try:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    tmp.write(raw)
+                    with uploaded_cal.getbuffer() as buf:   # no extra copy of the bytes
+                        tmp.write(buf)
                     tmp_path = tmp.name
-                del raw
-                gc.collect()
 
                 # Capture printed output from calibrate_peak_vel
                 captured = io.StringIO()
@@ -582,6 +599,7 @@ Two methods are available — run both when possible:
                         ref_displacement_um  = ref_disp_um,
                         ref_carrier_db       = ref_carrier_db,
                         calibration_method   = cal_method_key,
+                        fft_trim             = fft_trim,
                     )
                 except Exception as e:
                     sys.stdout = old_out
@@ -593,7 +611,7 @@ Two methods are available — run both when possible:
             finally:
                 if tmp_path and os.path.exists(tmp_path):
                     os.unlink(tmp_path)
-                gc.collect()
+                release_memory()
 
             log_text = captured.getvalue()
 

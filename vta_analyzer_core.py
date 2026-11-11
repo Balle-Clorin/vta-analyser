@@ -77,6 +77,46 @@ Version 5.7 — REV-23. Fixed a memory leak: analyse()'s result dict was storing
             trimmed to 50ms before being returned. No effect on any calculated
             value (VTA, F_signed, phi, SNR, etc.) -- confirmed identical output
             before and after on the same test file.
+Version 5.8 — REV-24. Memory/CPU fixes, no change to any formula. Measured on a
+            synthetic 3-min 48kHz stereo track through the Streamlit app: peak RSS
+            1.8GB (2.8GB for an awkward track length) -> 0.77GB; RSS left behind
+            after the run 1.3GB -> 0.27GB; ~20% faster (3.6x faster on an awkward
+            length). With fft_trim off, analyse() output is bit-identical to REV-23.
+            1) REV-23's trim did not work. `arr[:n]` is a VIEW: it keeps the whole
+               full-length base array alive, so every result still carried ~6
+               full-length float64 arrays per channel (~400MB at 3min/48kHz). The
+               snippets are now real copies (.copy()) and the full-length arrays
+               are deleted as soon as they are no longer needed.
+            2) The 2-second "sign check" pass only feeds a verbose diagnostic print
+               (F_signed has come from dc_track since REV-21) yet re-ran the whole
+               signal chain over the entire recording. Now opt-in:
+               analyse(sign_check=True). The command-line entry point keeps it on;
+               the Streamlit app and calibrate_peak_vel() leave it off.
+            3) scipy.signal.hilbert() keeps ~4 complex copies alive at once; replaced
+               by an in-place equivalent (_hilbert_lowmem, bit-identical output).
+               np.hanning() on a multi-million-sample signal plus its temporaries
+               is replaced by a chunked in-place Hann (_apply_hann_inplace, also
+               bit-identical). Band-limited copies are freed as soon as used.
+            4) New optional analyse(fft_trim=True): drop <=1% of samples from the
+               END so full-length FFTs run at a fast size (primes 2,3,5,7,11). A
+               track whose length has a large prime factor otherwise forces
+               Bluestein FFTs: 3-8x slower and ~2x the memory. Off by default.
+               VTA/HTA change by <1e-4 deg. calibrate_peak_vel() Method A is never
+               trimmed (its FFT is read at the exact file length).
+            5) plot_spectrum(): segment-averaged spectrum (2^18-sample Hann segments,
+               50% overlap, 4x zero-padded so tone levels agree with the old plot
+               to <0.05dB) instead of one full-length FFT per channel.
+            7) tracing_distortion(): harmonic levels now use parabolic interpolation
+               of the log-magnitude around each peak (plus a fitted Hann bias term). The old plain max-bin readout
+               varied by 2.4dB p-p with recording length alone (Hann scalloping,
+               up to 1.4dB per tone). Harmonic dB values WILL differ from REV-23
+               by that amount; the new ones are the accurate ones.
+            8) calibrate_peak_vel() Method A uses the same interpolated peak reading
+               (_interp_peak_amp). Its 400Hz/carrier amplitude ratio no longer
+               depends on the file length (up to 1.4dB per tone before), so
+               PEAK_VEL_A values WILL differ from REV-23 -- the new ones are right.
+            6) calibrate_peak_vel(): normalises in place instead of keeping a second
+               copy of the whole file; analyse() results are identical.
 
 Signal chain (Fig. 4 of patent):
 
@@ -143,6 +183,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from scipy import signal as sig
+from scipy import fft as sp_fft
 
 # ── Try soundfile, fall back gracefully ──────────────────────────────────────
 try:
@@ -442,6 +483,111 @@ def apply(sos, x):
     return sig.sosfiltfilt(sos, x)
 
 
+# ── REV-24 memory helpers ─────────────────────────────────────────────────────
+def _hilbert_lowmem(x):
+    """Analytic signal of a real 1-D array.
+
+    Bit-identical to scipy.signal.hilbert(x) but works on ONE complex buffer.
+    scipy builds fft(x), a complex multiplier h, fft*h and the ifft output --
+    four complex arrays alive at once (~64 bytes/sample).  Here the spectrum
+    is edited in place and inverted in place (~16 bytes/sample).
+    """
+    x  = np.asarray(x)
+    N  = x.shape[-1]
+    Xf = sp_fft.fft(x, N)
+    if N % 2 == 0:
+        Xf[1:N // 2] *= 2.0
+        Xf[N // 2 + 1:] = 0.0
+    else:
+        Xf[1:(N + 1) // 2] *= 2.0
+        Xf[(N + 1) // 2:] = 0.0
+    return sp_fft.ifft(Xf, overwrite_x=True)
+
+
+def _apply_hann_inplace(x, chunk=1 << 20):
+    """x *= np.hanning(len(x)), computed chunk by chunk (bit-identical result).
+
+    np.hanning(N) for a multi-million-sample signal allocates the window plus
+    several same-sized temporaries.  Returns the sum of the window so callers
+    that need the coherent gain (mean of the window) do not need the window.
+    x must be a writable float64 array.
+    """
+    N = len(x)
+    if N < 2:
+        return float(N)
+    total = 0.0
+    for k in range(0, N, chunk):
+        m = min(chunk, N - k)
+        n = np.arange(1 - N + 2 * k, 1 - N + 2 * (k + m), 2)
+        w = 0.5 + 0.5 * np.cos(np.pi * n / (N - 1))
+        x[k:k + m] *= w
+        total += float(np.sum(w))
+    return total
+
+
+def _fast_len_down(n):
+    """Largest FFT-friendly length <= n: only prime factors 2,3,5,7,11, which pocketfft
+    handles natively (scipy's prev_fast_len, with a plain-python fallback)."""
+    pf = getattr(sp_fft, 'prev_fast_len', None)
+    if pf is not None:
+        try:
+            return int(pf(n, real=False))
+        except Exception:
+            pass
+    m = n
+    while m > 1:
+        r = m
+        for p in (2, 3, 5, 7, 11):
+            while r % p == 0:
+                r //= p
+        if r == 1:
+            return m
+        m -= 1
+    return n
+
+
+def _interp_peak_amp(spec, freqs, fc, bw):
+    """Peak amplitude of a Hann-windowed amplitude spectrum within fc +/- bw.
+
+    A plain max-bin reading loses up to 1.4 dB (Hann scalloping) depending on where
+    the tone falls between bins, i.e. on the exact recording length.  Here a
+    parabola is fitted through the log-magnitude of the 3 bins around the maximum,
+    and the small deterministic bias of a Hann mainlobe (not exactly parabolic in
+    log) is removed with a fitted term; the residual is below 0.001 dB.
+    Spectrum must come from a Hann-windowed, un-padded FFT.
+    """
+    idx = np.flatnonzero((freqs >= fc - bw) & (freqs <= fc + bw))
+    if idx.size == 0:
+        return 0.0
+    k = int(idx[np.argmax(spec[idx])])
+    b = float(spec[k])
+    if 0 < k < len(spec) - 1:
+        a, c = float(spec[k - 1]), float(spec[k + 1])
+        if a > 0.0 and c > 0.0 and b > 0.0:
+            la, lb, lc = np.log(a), np.log(b), np.log(c)
+            den = la - 2.0 * lb + lc
+            if den < 0.0:                           # proper local maximum
+                d = 0.5 * (la - lc) / den           # offset in bins
+                if abs(d) <= 0.5:
+                    return float(np.exp(lb - 0.25 * (la - lc) * d
+                                        - 0.14076533 * d**2 - 0.03178888 * d**4))
+    return b
+
+
+def _trim_to_fast_len(x, max_loss=0.01):
+    """Drop a few samples from the END so full-length FFTs run at a fast size.
+
+    A recording whose length has a large prime factor forces Bluestein FFTs:
+    several times slower and ~2x the memory.  Never drops more than max_loss
+    (1 %) of the signal -- in practice ~0.1 s of a 3-minute track at 48 kHz, 0.6 s at
+    worst; lengths that are already fast are left alone.  Returns a view; the
+    caller's array is untouched.
+    """
+    n = len(x)
+    m = _fast_len_down(n)
+    return x[:m] if (m < n and m >= n * (1.0 - max_loss)) else x
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  INVERSE RIAA FILTER
 # ═════════════════════════════════════════════════════════════════════════════
@@ -520,18 +666,30 @@ def path_a(audio: np.ndarray, fs: float, f_low=F_MOD, f_high=F_CARRIER) -> np.nd
     # [44] 2kHz HPF + 400Hz notch  (let sidebands around 4kHz pass)
     hpf      = apply(_sos_hp(fs, 2000.0, order=4), audio)
     notch    = apply(_sos_notch(fs, f_low, Q=20),  hpf)
+    del hpf
 
     # [46]+[48] Zero-crossing FM discriminator via instantaneous frequency
     #   The axis-crossing detector converts the carrier to a square wave;
     #   this is equivalent to taking the sign() then differentiating — in
     #   DSP the Hilbert-transform approach gives the same instantaneous freq.
-    analytic  = sig.hilbert(notch)
-    inst_ph   = np.unwrap(np.angle(analytic))
-    inst_freq = np.concatenate([[0], np.diff(inst_ph)]) * fs / (2*np.pi)
-    deviation = inst_freq - f_high          # FM deviation in Hz (baseband)
+    analytic  = _hilbert_lowmem(notch)      # == sig.hilbert(notch), one buffer
+    del notch
+    _ph       = np.angle(analytic)
+    del analytic
+    inst_ph   = np.unwrap(_ph)
+    del _ph
+    inst_freq = np.empty_like(inst_ph)      # == concatenate([[0], diff(inst_ph)])
+    inst_freq[0] = 0.0
+    np.subtract(inst_ph[1:], inst_ph[:-1], out=inst_freq[1:])
+    del inst_ph
+    inst_freq *= fs                         # same operation order as before:
+    inst_freq /= (2*np.pi)                  #   (diff * fs) / (2*pi)
+    inst_freq -= f_high                     # FM deviation in Hz (baseband)
+    deviation = inst_freq
 
     # [50] LPF — isolate f_low component of FM deviation
     dev_filt  = apply(_sos_lp(fs, f_low * 2.5, order=4), deviation)
+    del deviation, inst_freq
 
     # Note: block [52] phase compensator (hardware: RC network to correct HPF
     # residual phase at f_high) is NOT needed in DSP — the Hilbert-transform
@@ -590,8 +748,9 @@ def path_b(audio: np.ndarray, fs: float,
 
     if mode == 'tracing':
         # [57] 90° phase shift — implemented via Hilbert transform
-        analytic = sig.hilbert(ref_sine)
-        ref_sine = np.imag(analytic)     # 90° shifted
+        analytic = _hilbert_lowmem(ref_sine)
+        ref_sine = np.imag(analytic).copy()   # 90° shifted (copy: np.imag is a view)
+        del analytic
 
     # [56] Axis crossing detector: sine → square wave
     square = np.sign(ref_sine)
@@ -740,7 +899,8 @@ def extract_F_and_phi(dev_signal: np.ndarray, audio: np.ndarray,
               reliable — useful for flagging near-null readings where L/R
               channels are prone to disagree.
     """
-    t = np.arange(len(dev_signal)) / fs
+    # (time base is generated per segment below -- a full-length float64
+    #  time vector would cost 8 bytes/sample for nothing)
 
     # Narrower reference bandwidth (was ±60% of f_low, now ±25%) — since
     # f_low is now the auto-detected actual frequency, a tight filter no
@@ -750,6 +910,8 @@ def extract_F_and_phi(dev_signal: np.ndarray, audio: np.ndarray,
     e2 = apply(_sos_bp(fs, f_low, bw, order=4), dev_signal)          # E2: FM deviation band
     e1_raw = apply(_sos_lp(fs, f_low * 3, order=4), audio)
     e1 = apply(_sos_bp(fs, f_low, bw, order=4), e1_raw)              # E1: record reference tone
+
+    del e1_raw
 
     # Longer segments (1.0 s vs 0.5 s) for better coherent averaging per
     # segment, while still short enough that slow wow (0.5-3 Hz) doesn't
@@ -763,7 +925,7 @@ def extract_F_and_phi(dev_signal: np.ndarray, audio: np.ndarray,
         sl  = slice(i * seg_len, (i + 1) * seg_len)
         e2s = e2[sl]
         e1s = e1[sl]
-        ts  = t[sl]
+        ts  = np.arange(sl.start, sl.start + len(e2s)) / fs
         N   = len(e2s)
         if N == 0:
             continue
@@ -837,11 +999,14 @@ def tracing_distortion(audio: np.ndarray, fs: float,
 
     N      = len(audio_lp)
     freqs  = np.fft.rfftfreq(N, 1/fs)
-    spec   = np.abs(np.fft.rfft(audio_lp * np.hanning(N))) * 2 / N
+    _apply_hann_inplace(audio_lp)           # window in place (audio_lp is ours)
+    spec   = np.abs(np.fft.rfft(audio_lp))
+    del audio_lp
+    spec  *= 2
+    spec  /= N
 
     def peak_bin(fc, bw=20.0):
-        mask = (freqs >= fc-bw) & (freqs <= fc+bw)
-        return float(np.max(spec[mask])) if np.any(mask) else 0.0
+        return _interp_peak_amp(spec, freqs, fc, bw)
 
     fund = peak_bin(f_low)
     out  = {}
@@ -892,8 +1057,10 @@ def detect_actual_frequency(audio: np.ndarray, fs: float,
     # Use the full signal for maximum frequency resolution.
     # Hann window suppresses spectral leakage from neighbouring tones.
     N     = len(audio)
-    win   = np.hanning(N)
-    spec  = np.abs(np.fft.rfft(audio * win))
+    xw    = np.array(audio, dtype=np.float64)   # private copy, windowed in place
+    _apply_hann_inplace(xw)
+    spec  = np.abs(np.fft.rfft(xw))
+    del xw
     freqs = np.fft.rfftfreq(N, 1.0 / fs)
 
     # Restrict search to window around f_nominal
@@ -959,9 +1126,13 @@ def measure_sidebands(audio: np.ndarray, fs: float,
       usb_found_hz : actual USB peak frequency found
     """
     N        = len(audio)
-    win      = np.hanning(N)
-    win_corr = 2.0 / np.mean(win)
-    spec     = np.abs(np.fft.rfft(audio * win)) * win_corr / N
+    xw       = np.array(audio, dtype=np.float64)   # private copy, windowed in place
+    win_sum  = _apply_hann_inplace(xw)
+    win_corr = 2.0 / (win_sum / N)                  # == 2 / mean(hanning(N))
+    spec     = np.abs(np.fft.rfft(xw))
+    del xw
+    spec    *= win_corr
+    spec    /= N
     freqs    = np.fft.rfftfreq(N, 1.0 / fs)
     bin_hz   = freqs[1]
 
@@ -1024,13 +1195,24 @@ def analyse(audio: np.ndarray, fs: float,
             swap_channels: bool = False,
             modulation: str = MODULATION,
             verbose: bool  = True,
-            _demo: bool    = False) -> dict:
+            _demo: bool    = False,
+            sign_check: bool = False,
+            fft_trim: bool   = False) -> dict:
     """Run the full patent signal chain on one channel of audio.
 
     _demo : suppress the large-phase warning when called from the self-test
             (the synthesised demo signal has φ≈±90° by construction and would
             always fire the warning, giving a misleading impression of an error).
+    sign_check : also run the 2-second-segment sign-stability pass. It only feeds
+            a verbose diagnostic print (F_signed comes from dc_track since
+            REV-21) but costs a second full pass of the signal chain, so it is
+            off by default.  The command-line entry point turns it on.
+    fft_trim : drop a few samples (<= 1 %) from the END so full-length FFTs run
+            at an FFT-friendly size (see _trim_to_fast_len).  Off by default so
+            existing results are unchanged.
     """
+    if fft_trim:
+        audio = _trim_to_fast_len(audio)
 
     # ── Auto-detect actual tone frequencies ──────────────────────────────
     # Turntable speed error or non-standard cutting frequencies can shift
@@ -1043,13 +1225,14 @@ def analyse(audio: np.ndarray, fs: float,
     # Pre-filter before detection to isolate each tone cleanly:
     #   f_low  : bandpass ±15 % around nominal f_low
     #   f_high : highpass above f_low×3 to remove the modulating tone
-    _audio_low  = apply(_sos_bp(fs, f_low,  f_low  * 0.30, order=4), audio)
-    _audio_high = apply(_sos_hp(fs, f_low * 3.0,            order=4), audio)
-
+    _audio_low    = apply(_sos_bp(fs, f_low,  f_low  * 0.30, order=4), audio)
     f_low_actual  = detect_actual_frequency(_audio_low,  fs, f_low,
                                              search_range=f_low  * 0.05)
+    del _audio_low
+    _audio_high   = apply(_sos_hp(fs, f_low * 3.0,            order=4), audio)
     f_high_actual = detect_actual_frequency(_audio_high, fs, f_high,
                                              search_range=f_high * 0.05)
+    del _audio_high
 
     if verbose:
         offset_low  = f_low_actual  - f_low
@@ -1128,13 +1311,25 @@ def analyse(audio: np.ndarray, fs: float,
     # ── Chopper chain — TRACKING mode (0°) ───────────────────────────────
     sq_track    = path_b(audio, fs, f_low, f_high, mode='tracking')
     dc_track, chopped_track, dc_track_sig = chopper_lpf(dev_signal, sq_track, fs, f_low)
+    _snip = int(fs * 0.05)   # 50 ms -- plot_signal_chain only uses 25 ms
+    # .copy() is essential: a bare arr[:n] slice is a VIEW that keeps the whole
+    # full-length base array alive. That is what silently defeated the REV-23 trim.
+    _snip_sq_track      = sq_track[:_snip].copy()
+    _snip_chopped_track = chopped_track[:_snip].copy()
+    _snip_dc_track_sig  = dc_track_sig[:_snip].copy()
+    del sq_track, chopped_track, dc_track_sig
 
     # ── Chopper chain — TRACING mode (90°) ───────────────────────────────
     sq_trace    = path_b(audio, fs, f_low, f_high, mode='tracing')
     dc_trace, chopped_trace, dc_trace_sig = chopper_lpf(dev_signal, sq_trace, fs, f_low)
+    _snip_chopped_trace = chopped_trace[:_snip].copy()
+    _snip_dc_trace_sig  = dc_trace_sig[:_snip].copy()
+    del sq_trace, chopped_trace, dc_trace_sig
 
     # ── Extract F (peak deviation, unsigned) ─────────────────────────────
     F_peak, phi_deg, snr_db = extract_F_and_phi(dev_signal, audio, fs, f_low)
+    _snip_dev_signal = dev_signal[:_snip].copy()
+    del dev_signal
 
     # ── Confidence flag from SNR ──────────────────────────────────────────
     # Readings near the reference angle (F small by design) are inherently
@@ -1207,7 +1402,7 @@ def analyse(audio: np.ndarray, fs: float,
     dc_top_mean  = 0.0   # initialise here so verbose print never crashes
 
     # Only segment if we have at least 2 full segments
-    if len(audio) >= seg_len_sign * 2:
+    if sign_check and len(audio) >= seg_len_sign * 2:
         n_segs_sign = len(audio) // seg_len_sign
         for i in range(n_segs_sign):
             sl  = slice(i * seg_len_sign, (i + 1) * seg_len_sign)
@@ -1334,7 +1529,6 @@ def analyse(audio: np.ndarray, fs: float,
     #   offset sets zero-deviation point at θR (16.0° for CBS STR-112)
     meter_reading = vta   # in degrees, directly
 
-    _snip = int(fs * 0.05)   # 50ms -- double what plot_signal_chain actually uses
 
     results = dict(
         channel          = channel,
@@ -1360,13 +1554,14 @@ def analyse(audio: np.ndarray, fs: float,
         # ~7 full-length float64 copies per channel per track, which for a
         # multi-minute track is on the order of 1GB *per result*. In a batch
         # loop that accumulates results across tracks, this grows unboundedly.
-        dev_signal    = dev_signal[:_snip],
-        sq_track      = sq_track[:_snip],
-        chopped_track = chopped_track[:_snip],
-        dc_track_sig  = dc_track_sig[:_snip],
-        chopped_trace = chopped_trace[:_snip],
-        dc_trace_sig  = dc_trace_sig[:_snip],
-        audio         = audio[:_snip],
+        dev_signal    = _snip_dev_signal,       # all 50 ms COPIES (REV-24)
+        sq_track      = _snip_sq_track,
+        chopped_track = _snip_chopped_track,
+        dc_track_sig  = _snip_dc_track_sig,
+        chopped_trace = _snip_chopped_trace,
+        dc_trace_sig  = _snip_dc_trace_sig,
+        audio         = audio[:_snip].copy(),
+        n_samples     = len(audio),             # samples actually analysed
         sidebands     = sidebands,    # AM-IM: usb_pct, lsb_pct, imd_pct
     )
 
@@ -1552,7 +1747,7 @@ def plot_meter_dashboard(results_list: list,
     fig  = plt.figure(figsize=(5*n, 14), facecolor=DARK)
 
     # ── Main title ────────────────────────────────────────────────────────
-    fig.suptitle('Vertical Tracking Angle Meter  —  US Patent 4,359,768 rev23',
+    fig.suptitle('Vertical Tracking Angle Meter  —  US Patent 4,359,768 rev24',
                  color=WHITE, fontsize=16, fontweight='bold', y=0.98)
 
     # ── Info banner: script / WAV / description ───────────────────────────
@@ -1744,6 +1939,32 @@ def plot_meter_dashboard(results_list: list,
 #  SPECTRUM PLOT  — verify tone detection and signal quality
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _avg_amp_spectrum(x, fs, nseg=1 << 18, pad=4):
+    """Segment-averaged amplitude spectrum (Hann, 50 % overlap, zero-padded).
+
+    Same convention as before (|rfft(x*hann)| * 2/N, RMS-averaged over
+    segments), but memory is O(nseg) instead of O(len(x)) and the FFT size is
+    always a fast size.  Each segment is zero-padded `pad` times so a tone that
+    falls between bins is not read low (Hann scalloping loss: up to 1.4 dB
+    unpadded, < 0.1 dB at pad=4).  nseg = 2**18 -> ~0.18 Hz resolution at 48 kHz.
+    """
+    x = np.asarray(x)
+    n = len(x)
+    M = min(nseg, n)
+    nfft = sp_fft.next_fast_len(M * pad, real=True)
+    freqs = np.fft.rfftfreq(nfft, 1.0 / fs)
+    acc = np.zeros(len(freqs))
+    k = 0
+    for start in range(0, n - M + 1, max(1, M // 2)):
+        seg = np.array(x[start:start + M], dtype=np.float64)
+        _apply_hann_inplace(seg)
+        a = np.abs(np.fft.rfft(seg, n=nfft))
+        a *= 2.0 / M
+        acc += a * a
+        k += 1
+    return freqs, np.sqrt(acc / max(k, 1))
+
+
 def plot_spectrum(audio_map: dict, fs: float,
                  f_low: float = F_MOD,
                  f_high: float = F_CARRIER) -> plt.Figure:
@@ -1771,10 +1992,9 @@ def plot_spectrum(audio_map: dict, fs: float,
         audio = audio_map[ch]
         col_color = ch_colors.get(ch, ACCENT)
 
-        N     = len(audio)
-        freqs = np.fft.rfftfreq(N, 1 / fs)
-        spec  = 20 * np.log10(
-                    np.abs(np.fft.rfft(audio * np.hanning(N))) * 2 / N + 1e-12)
+        freqs, _amp = _avg_amp_spectrum(audio, fs)
+        spec  = 20 * np.log10(_amp + 1e-12)
+        del _amp
 
         def find_peak_db(fc, bw=None):
             # Default window: ±15% of centre frequency
@@ -1790,6 +2010,8 @@ def plot_spectrum(audio_map: dict, fs: float,
         mask = freqs <= f_max
         ax0.plot(freqs[mask], spec[mask],
                  color=col_color, linewidth=0.8, alpha=0.92)
+        _lo, _hi = float(np.min(spec[mask])), float(np.max(spec[mask]))
+        ax0.set_ylim(_lo - 0.14 * (_hi - _lo), _hi + 0.05 * (_hi - _lo))   # room for the verdict text
         ax0.axvline(f_low,  color=GREEN, linewidth=1.2, linestyle='--',
                     label=f'{f_low:.0f} Hz (mod tone)')
         ax0.axvline(f_high, color=AMBER, linewidth=1.2, linestyle='--',
@@ -1872,7 +2094,10 @@ def calibrate_peak_vel(wav_path: str,
                        theta_r: float          = RECORDING_ANGLE,
                        ref_displacement_um: float = 11.2,
                        ref_carrier_db: float      = -18.0,
-                       calibration_method: str    = "both") -> dict:
+                       calibration_method: str    = "both",
+                       fft_trim: bool             = False) -> dict:
+    # fft_trim only applies to the analyse() calls of Method B. Method A reads FFT bin
+    # maxima of the whole file, which depend on its exact length, so it is never trimmed.
     """
     Calculate PEAK_VEL using TWO independent methods and cross-check them.
 
@@ -1908,10 +2133,11 @@ def calibrate_peak_vel(wav_path: str,
 
     import soundfile as sf
     data, fs = sf.read(wav_path, always_2d=True)
-    # Do NOT normalise — we need consistent amplitude levels
-    # But do check for clipping
-    peak_raw = float(np.max(np.abs(data)))
-    data_norm = data / peak_raw   # normalise for analysis only
+    # Normalise IN PLACE (was `data / peak_raw`: a second full copy of the file).
+    # `data` is only used for its shape/length below, so one array is enough.
+    peak_raw = max(float(data.max()), -float(data.min()))
+    data /= peak_raw
+    data_norm = data
 
     W = 60   # box width
 
@@ -1932,7 +2158,6 @@ def calibrate_peak_vel(wav_path: str,
     # mean speed, which is what the label velocity refers to.
     audio_ref = data_norm[:, 0]
     N_full    = len(audio_ref)
-    freqs_full = np.fft.rfftfreq(N_full, 1/fs)
 
     seg_len_cal = int(fs * 2.0)
     n_segs_cal  = max(3, N_full // seg_len_cal)
@@ -1985,14 +2210,17 @@ def calibrate_peak_vel(wav_path: str,
         for ch_idx, ch in enumerate(['L', 'R']):
             if ch_idx >= data.shape[1]:
                 break
-            audio_ch  = data_norm[:, ch_idx]
-            N_ch      = len(audio_ch)
+            N_ch      = len(data_norm)
             freqs_ch  = np.fft.rfftfreq(N_ch, 1/fs)
-            spec_ch   = np.abs(np.fft.rfft(audio_ch * np.hanning(N_ch))) * 2 / N_ch
+            xw        = np.array(data_norm[:, ch_idx], dtype=np.float64)
+            _apply_hann_inplace(xw)
+            spec_ch   = np.abs(np.fft.rfft(xw))
+            del xw
+            spec_ch  *= 2
+            spec_ch  /= N_ch
 
             def pa(fc, bw):
-                m = (freqs_ch >= fc - bw) & (freqs_ch <= fc + bw)
-                return float(np.max(spec_ch[m])) if np.any(m) else 0.0
+                return _interp_peak_amp(spec_ch, freqs_ch, fc, bw)
 
             a_low  = pa(f_low_actual,  bw=min(40, f_low_actual  * 0.08))
             a_high = pa(f_high_actual, bw=min(80, f_high_actual * 0.04))
@@ -2052,7 +2280,8 @@ def calibrate_peak_vel(wav_path: str,
                 r_trial = analyse(data_norm[:, ch_idx], fs,
                                   channel=ch, f_low=f_low, f_high=f_high,
                                   R=GROOVE_RADIUS, V_low=1.0,
-                                  theta_r=theta_r, verbose=False)
+                                  theta_r=theta_r, verbose=False,
+                                  fft_trim=fft_trim)
                 F_vals.append(abs(r_trial['F_signed_hz']))
                 print(f"║  Ch {ch} |F_signed| = {r_trial['F_signed_hz']:+8.3f} Hz                          ║")
 
@@ -2072,7 +2301,8 @@ def calibrate_peak_vel(wav_path: str,
                 r_v = analyse(data_norm[:, ch_idx], fs,
                               channel=ch, f_low=f_low, f_high=f_high,
                               R=GROOVE_RADIUS, V_low=peak_vel_B,
-                              theta_r=theta_r, verbose=False)
+                              theta_r=theta_r, verbose=False,
+                              fft_trim=fft_trim)
                 vtas_verify.append(r_v['vta_deg'])
                 print(f"║  Verify Ch {ch}: VTA={r_v['vta_deg']:6.3f}°                              ║")
             print(f"║  Verify mean:  VTA={np.mean(vtas_verify):6.3f}°  (target {known_vta_deg:.1f}°)             ║")
@@ -2359,7 +2589,8 @@ if __name__ == '__main__':
                       swap_channels  = SWAP_CHANNELS,
                       modulation     = MODULATION,
                       verbose        = True,
-                      _demo          = DEMO_MODE)
+                      _demo          = DEMO_MODE,
+                      sign_check     = True)
         results_all.append(res)
 
     # ── Summary report ────────────────────────────────────────────────────
